@@ -41,3 +41,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 name = "async_smoke"
 path = "tests/async_smoke.rs"
 required-features = ["async"]
+
+[[test]]
+name = "concurrent_open"
+path = "tests/concurrent_open.rs"
+# Always compiles; the inner `mod async_open` is gated on the
+# `async` feature so the async test only runs when it's enabled.

@@ -78,28 +78,74 @@ impl AsyncPgStore {
             schema: config.schema.clone(),
         };
 
-        // Bootstrap: open one connection, CREATE SCHEMA if needed,
-        // SET search_path, run migrations, verify version. Subsequent
-        // per-checkout calls only re-apply SET search_path — never
-        // CREATE SCHEMA. Concurrent `CREATE SCHEMA IF NOT EXISTS`
-        // calls race on Postgres's pg_namespace catalog (a known
-        // limitation of IF NOT EXISTS DDL) so we do it exactly once
-        // here while we're single-threaded.
-        let conn = store
+        // Bootstrap: check out one connection, take a Postgres
+        // advisory lock that's shared across every concurrent
+        // `AsyncPgStore::open` (and every `PgStore::open`), then run
+        // CREATE SCHEMA + SET search_path + the full migration set
+        // under the lock. Without the lock, concurrent openers race
+        // on `pg_namespace_nspname_index` (CREATE SCHEMA) and on
+        // `pg_type_typname_nsp_index` (CREATE TABLE) — neither
+        // `IF NOT EXISTS` clause makes those DDL statements safe
+        // under concurrency, per the Postgres docs. The lock auto-
+        // releases on commit. Subsequent per-checkout calls in
+        // `Self::conn` only re-apply `SET search_path`, no DDL.
+        let mut conn = store
             .pool
             .get()
             .await
             .map_err(|e| StoreOpenError::Connect(format!("pool checkout: {e}")))?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| StoreOpenError::Connect(format!("bootstrap begin: {e}")))?;
+        tx.batch_execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('llm386_bootstrap', 0));",
+        )
+        .await
+        .map_err(|e| StoreOpenError::Connect(format!("advisory lock: {e}")))?;
+
         if let Some(schema) = &config.schema {
-            conn.batch_execute(&format!(
-                "CREATE SCHEMA IF NOT EXISTS \"{schema}\"; SET search_path TO \"{schema}\";"
+            tx.batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS \"{schema}\"; SET search_path TO \"{schema}\";",
             ))
-            .await?;
+            .await
+            .map_err(|e| StoreOpenError::Connect(format!("CREATE SCHEMA: {e}")))?;
         }
-        run_migrations(&conn).await?;
-        check_schema_version(&conn).await?;
-        debug!(schema = CURRENT_SCHEMA, "AsyncPgStore ready");
+        tx.batch_execute(MIGRATION_SQL).await?;
+        tx.execute(
+            "INSERT INTO llm386_meta (key, value)
+             VALUES ('schema_version', $1)
+             ON CONFLICT (key) DO NOTHING",
+            &[&CURRENT_SCHEMA.to_be_bytes().to_vec()],
+        )
+        .await?;
+        let row = tx
+            .query_opt(
+                "SELECT value FROM llm386_meta WHERE key = 'schema_version'",
+                &[],
+            )
+            .await?
+            .ok_or_else(|| StoreOpenError::CorruptMeta("schema_version row missing".into()))?;
+        let bytes: &[u8] = row.get(0);
+        if bytes.len() != 4 {
+            return Err(StoreOpenError::CorruptMeta(format!(
+                "schema_version width {}",
+                bytes.len()
+            )));
+        }
+        let arr: [u8; 4] = bytes.try_into().expect("checked width above");
+        let found = i32::from_be_bytes(arr);
+        if found != CURRENT_SCHEMA {
+            return Err(StoreOpenError::SchemaMismatch {
+                expected: CURRENT_SCHEMA,
+                found,
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreOpenError::Connect(format!("bootstrap commit: {e}")))?;
         drop(conn);
+        debug!(schema = CURRENT_SCHEMA, "AsyncPgStore ready");
 
         Ok(store)
     }
@@ -465,44 +511,3 @@ fn format_pg_err(e: &tokio_postgres::Error) -> String {
     }
 }
 
-async fn run_migrations(
-    conn: &deadpool_postgres::Object,
-) -> Result<(), StoreOpenError> {
-    conn.batch_execute(MIGRATION_SQL).await?;
-    conn.execute(
-        "INSERT INTO llm386_meta (key, value)
-         VALUES ('schema_version', $1)
-         ON CONFLICT (key) DO NOTHING",
-        &[&CURRENT_SCHEMA.to_be_bytes().to_vec()],
-    )
-    .await?;
-    Ok(())
-}
-
-async fn check_schema_version(
-    conn: &deadpool_postgres::Object,
-) -> Result<(), StoreOpenError> {
-    let row = conn
-        .query_opt(
-            "SELECT value FROM llm386_meta WHERE key = 'schema_version'",
-            &[],
-        )
-        .await?
-        .ok_or_else(|| StoreOpenError::CorruptMeta("schema_version row missing".into()))?;
-    let bytes: &[u8] = row.get(0);
-    if bytes.len() != 4 {
-        return Err(StoreOpenError::CorruptMeta(format!(
-            "schema_version width {}",
-            bytes.len()
-        )));
-    }
-    let arr: [u8; 4] = bytes.try_into().expect("checked width above");
-    let found = i32::from_be_bytes(arr);
-    if found != CURRENT_SCHEMA {
-        return Err(StoreOpenError::SchemaMismatch {
-            expected: CURRENT_SCHEMA,
-            found,
-        });
-    }
-    Ok(())
-}

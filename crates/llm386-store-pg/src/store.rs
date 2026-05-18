@@ -51,15 +51,19 @@ impl PgStore {
             return Err(StoreOpenError::InvalidSchemaName(schema.clone()));
         }
 
-        // Bootstrap the optional schema on a single dedicated
-        // connection *before* the pool exists. `CREATE SCHEMA IF NOT
-        // EXISTS` is documented as not transactional — running it
-        // concurrently from N pool connections races on
-        // `pg_namespace_nspname_index` and dumps "db error" lines
-        // even though the schema does end up created.
-        if let Some(schema) = &config.schema {
-            bootstrap_schema(url, schema)?;
-        }
+        // Bootstrap (CREATE SCHEMA + migrations + schema-version
+        // check) on a single dedicated connection *before* the pool
+        // exists, all under a Postgres advisory lock that's shared
+        // across every concurrent opener (sync or async, same
+        // process or different). Without the lock, concurrent opens
+        // race on `pg_namespace_nspname_index` (CREATE SCHEMA) and
+        // on `pg_type_typname_nsp_index` (CREATE TABLE) — neither
+        // `IF NOT EXISTS` clause makes those DDL statements safe
+        // under concurrency. The lock auto-releases on commit. Once
+        // the bootstrap connection is closed and the pool is built,
+        // ongoing operations don't issue DDL, so the lock is never
+        // touched on the hot path.
+        bootstrap_and_migrate(url, config.schema.as_deref())?;
 
         let manager = PostgresConnectionManager::new(
             url.parse().map_err(|e: postgres::Error| {
@@ -75,10 +79,6 @@ impl PgStore {
         let pool = builder
             .build(manager)
             .map_err(|e| StoreOpenError::Connect(format!("r2d2 pool: {e}")))?;
-
-        let mut conn = pool.get().map_err(|e| StoreOpenError::Connect(e.to_string()))?;
-        run_migrations(&mut conn)?;
-        check_schema_version(&mut conn)?;
         debug!(schema = CURRENT_SCHEMA, "PgStore ready");
 
         Ok(Self { pool })
@@ -453,43 +453,42 @@ impl CustomizeConnection<postgres::Client, postgres::Error> for SearchPathCustom
     }
 }
 
-/// Create `schema` if it doesn't already exist, using a single
-/// dedicated connection. Tolerant of the `CREATE SCHEMA IF NOT
-/// EXISTS` race (Postgres documents this statement as not
-/// transactional — concurrent callers can still collide on
-/// `pg_namespace_nspname_index`): if the unique-violation fires the
-/// schema clearly exists, so it's safe to swallow.
-fn bootstrap_schema(url: &str, schema: &str) -> Result<(), StoreOpenError> {
+/// Bootstrap the schema + run migrations + verify version, on a
+/// fresh single-purpose connection, all under a Postgres advisory
+/// lock. The lock auto-releases on commit; subsequent opens find the
+/// schema and tables in place and the migration block becomes a no-op.
+///
+/// The lock id is the 64-bit hash of the literal string
+/// `'llm386_bootstrap'`. Sync and async openers all use the same
+/// constant so they serialize against one another. Collisions with
+/// other unrelated application code using advisory locks are
+/// astronomically unlikely on a 64-bit space.
+fn bootstrap_and_migrate(url: &str, schema: Option<&str>) -> Result<(), StoreOpenError> {
     let mut conn = postgres::Client::connect(url, NoTls)
         .map_err(|e| StoreOpenError::Connect(format!("bootstrap connection: {e}")))?;
-    let sql = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\";");
-    match conn.batch_execute(&sql) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // SQLSTATE 23505 = unique_violation; the schema already
-            // exists because another caller won the race.
-            if e.code().map(postgres::error::SqlState::code) == Some("23505") {
-                Ok(())
-            } else {
-                Err(StoreOpenError::Connect(format!("CREATE SCHEMA: {e}")))
-            }
-        }
-    }
-}
+    let mut tx = conn
+        .transaction()
+        .map_err(|e| StoreOpenError::Connect(format!("bootstrap begin: {e}")))?;
 
-fn run_migrations(conn: &mut PgConn) -> Result<(), StoreOpenError> {
-    conn.batch_execute(MIGRATION_SQL)?;
-    conn.execute(
+    tx.batch_execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('llm386_bootstrap', 0));",
+    )
+    .map_err(|e| StoreOpenError::Connect(format!("advisory lock: {e}")))?;
+
+    if let Some(schema) = schema {
+        tx.batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS \"{schema}\"; SET search_path TO \"{schema}\";",
+        ))
+        .map_err(|e| StoreOpenError::Connect(format!("CREATE SCHEMA: {e}")))?;
+    }
+    tx.batch_execute(MIGRATION_SQL)?;
+    tx.execute(
         "INSERT INTO llm386_meta (key, value)
          VALUES ('schema_version', $1)
          ON CONFLICT (key) DO NOTHING",
         &[&CURRENT_SCHEMA.to_be_bytes().to_vec()],
     )?;
-    Ok(())
-}
-
-fn check_schema_version(conn: &mut PgConn) -> Result<(), StoreOpenError> {
-    let row = conn
+    let row = tx
         .query_opt(
             "SELECT value FROM llm386_meta WHERE key = 'schema_version'",
             &[],
@@ -510,6 +509,9 @@ fn check_schema_version(conn: &mut PgConn) -> Result<(), StoreOpenError> {
             found,
         });
     }
+
+    tx.commit()
+        .map_err(|e| StoreOpenError::Connect(format!("bootstrap commit: {e}")))?;
     Ok(())
 }
 

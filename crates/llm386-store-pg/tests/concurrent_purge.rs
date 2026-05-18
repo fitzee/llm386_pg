@@ -99,21 +99,22 @@ impl Drop for DropGuard<'_> {
 /// implementation, at least one iteration will leave an orphan row in
 /// `llm386_blocks`; with the FOR UPDATE fix, every iteration leaves
 /// the table empty.
+// Number of iterations is a balance: enough to reliably trigger the
+// race on the buggy code path, but not so many that the test takes
+// forever. 50 is comfortable on a local Postgres; the race typically
+// fires within the first handful.
+const RACE_ITERS: u32 = 50;
+
 #[test]
 fn concurrent_purge_of_shared_block_leaves_no_orphan() {
     let Some((store, url, schema)) = open_test() else {
         eprintln!("skipped: TEST_DATABASE_URL not set");
         return;
     };
+
     let _guard = DropGuard { url: &url, schema: &schema };
 
-    // Number of iterations is a balance: enough to reliably trigger
-    // the race on the buggy code path, but not so many that the test
-    // takes forever. 50 is comfortable on a local Postgres; the race
-    // typically fires within the first handful.
-    const ITERS: u32 = 50;
-
-    for iter in 0..ITERS {
+    for iter in 0..RACE_ITERS {
         // Two distinct sessions, both referencing one content-deduped
         // block. The body varies per iteration so the dedup gives us
         // a different shared block each time.
