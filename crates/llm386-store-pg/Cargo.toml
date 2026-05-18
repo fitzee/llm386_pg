@@ -1,0 +1,25 @@
+[package]
+name = "llm386-store-pg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PostgreSQL-backed block and metadata storage for LLM386."
+
+[lints]
+workspace = true
+
+[dependencies]
+llm386-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tracing = { workspace = true }
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
+
+[dev-dependencies]
+proptest = { workspace = true }

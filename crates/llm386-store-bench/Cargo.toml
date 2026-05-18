@@ -1,0 +1,25 @@
+[package]
+name = "llm386-store-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Perf hammer for llm386 store backends (LMDB vs Postgres)."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "store-bench"
+path = "src/main.rs"
+
+[dependencies]
+llm386-core = { workspace = true }
+llm386-store-lmdb = { workspace = true }
+llm386-store-pg = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tempfile = { workspace = true }
+rand = "0.9"

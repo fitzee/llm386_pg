@@ -1,11 +1,11 @@
-# LLM386
+# LLM386 — Postgres backend fork
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 [![Status](https://img.shields.io/badge/status-alpha-yellow.svg)](#status)
-[![Last commit](https://img.shields.io/github/last-commit/fitzee/llm386)](https://github.com/fitzee/llm386/commits/main)
-[![Stars](https://img.shields.io/github/stars/fitzee/llm386?style=social)](https://github.com/fitzee/llm386/stargazers)
+
+> This is a fork of [LLM386](https://github.com/fitzee/llm386) that adds a **PostgreSQL-backed `BlockStore`** alongside the upstream LMDB one. The trait surface in `llm386-core` is unchanged; backends are selected at construction time. See [Postgres backend](#postgres-backend) for the rationale, schema, and a head-to-head perf comparison against LMDB.
 
 A Rust runtime that manages the external state needed to feed an LLM. It treats the model as a stateless inference function and handles the rest: persistent block storage, retrieval, paging into a model-specific token budget, and deterministic prompt assembly.
 
@@ -57,6 +57,122 @@ LLM386 is the runtime under that surface. The pieces:
 - A CLI that exposes the whole pipeline.
 
 It is a library first. The CLI is a thin shell over the library.
+
+## Postgres backend
+
+This fork adds `llm386-store-pg`, a `BlockStore` implementation backed by PostgreSQL, sitting alongside the upstream `llm386-store-lmdb`. The trait surface in `llm386-core` is unchanged — every other crate (pager, packer, retriever, trace, reduce) is backend-agnostic.
+
+### Why a Postgres backend
+
+LMDB is a memory-mapped, single-writer, single-host store. That is the right answer for many deployments — embedded, latency-sensitive, single-process — and the LMDB backend wins on read paths by a wide margin (see the perf table below). It is the wrong answer for a few specific scenarios:
+
+- **Multiple processes write to the same store.** LMDB serializes writers across the entire env; only one process holds the write lock at a time. Pod-replicated runtimes hit this immediately.
+- **No shared filesystem.** Orchestrators that schedule processes across nodes have no portable story for a writable LMDB file — NFS/EFS-mounted LMDB is undefined behavior.
+- **Operational machinery already exists for Postgres.** Connection pooling, schema migrations, snapshot backups, point-in-time recovery, observability, multi-tenant ACLs — every cloud-native runtime already runs this for its primary database. Reusing it for the LLM context store has no marginal ops cost.
+- **Native ACID across processes.** `put` writes the block, the hash index row, and the session-membership row in a single transaction. Concurrent writers don't see partial state.
+- **Future ANN co-location.** Adding `pgvector` lets `llm386-retrieve-ann` resolve against the same table that holds the blocks — schema metadata, conversation turns, tool results, and their embeddings all live in one table, queried by a single JOIN with an HNSW index. No separate vector database to operate.
+
+The PG backend is not "better" than LMDB. It targets a different operational model.
+
+### Schema
+
+Four tables, created on first connect via idempotent `CREATE TABLE IF NOT EXISTS` and re-checked on every open via a `schema_version` row in `llm386_meta`:
+
+```sql
+CREATE TABLE llm386_blocks (
+    id              BYTEA PRIMARY KEY,          -- 16-byte big-endian u128, time-ordered
+    kind            TEXT NOT NULL,
+    bytes           BYTEA NOT NULL,
+    token_counts    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    priority        REAL NOT NULL DEFAULT 0.0,
+    created_at      BIGINT NOT NULL,            -- unix ms
+    updated_at      BIGINT NOT NULL,
+    provenance      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    hash            BYTEA NOT NULL              -- blake3, 32 bytes
+);
+CREATE UNIQUE INDEX llm386_blocks_hash_idx ON llm386_blocks (hash);
+
+CREATE TABLE llm386_session_blocks (
+    session_id  BYTEA NOT NULL,
+    block_id    BYTEA NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+);
+
+CREATE TABLE llm386_edges (
+    from_id     BYTEA NOT NULL,
+    to_id       BYTEA NOT NULL,
+    kind        TEXT NOT NULL,
+    PRIMARY KEY (from_id, kind, to_id)
+);
+CREATE INDEX llm386_edges_to ON llm386_edges (to_id, kind);
+```
+
+A few design notes:
+
+- **`BYTEA(16)` for ids, not `UUID`.** `BlockId`'s chronological ordering comes from the raw bit layout (48-bit timestamp in the high bits). Postgres `UUID` compares lexicographically, which would scramble that ordering. Big-endian `BYTEA` preserves the natural `Ord` semantics exactly — `ORDER BY block_id ASC` returns blocks chronologically without a separate time column.
+- **Dedup via `ON CONFLICT (hash) DO NOTHING`.** A single statement satisfies the content-hash dedup invariant; a follow-up `SELECT id FROM llm386_blocks WHERE hash = $1` recovers the existing id when the insert collided.
+- **`JSONB` for structured fields.** `token_counts` and `provenance` round-trip through JSONB, with `BlockId` lineage encoded as hex strings (Postgres JSON can't represent u128 numerically). `provenance->>'labels'` queries work without schema changes.
+
+### When to use which
+
+- **LMDB**: embedded library, single process, read-heavy, low-latency. The default for the bundled CLI and Python SDK.
+- **Postgres**: multi-process or multi-node deployments, shared operational infrastructure, ACID across writers, future ANN co-location with `pgvector`.
+
+Both backends compile and ship in the workspace. Pick at construction time:
+
+```rust
+use llm386_store_pg::{PgStore, PgStoreConfig};
+
+let store = PgStore::open(
+    "postgres://user:pass@host/db",
+    &PgStoreConfig::default(),
+)?;
+```
+
+The schema is created on first connect; subsequent opens reuse the existing tables. Tests pass `schema: Some("my_test_schema".into())` to scope every pooled connection to an isolated schema via `SET search_path`.
+
+`verify` / `repair` integrity tooling is intentionally not ported — Postgres has native equivalents (`pg_dump`, foreign-key checks, `REINDEX`, `VACUUM`).
+
+### Performance
+
+Perf hammer in `crates/llm386-store-bench/`: 10,000 blocks of 1 KiB each, single thread, local Unix socket to PostgreSQL 18 on the same host (macOS 25.4, APFS, M-series).
+
+```
+backend  workload    samples        total    ops/sec        p50        p95        p99
+----------------------------------------------------------------------------------
+lmdb     put          10,000       37.70s        265      4.0ms      4.1ms      5.1ms
+lmdb     get          10,000       24.0ms    416,165      2.0µs      4.9µs      6.5µs
+lmdb     list            100        8.8ms     11,300     88.7µs     94.4µs    106.2µs
+lmdb     dedup        10,000       33.70s        297      3.0ms      4.1ms      5.0ms
+pg       put          10,000        3.10s      3,229    303.0µs    347.1µs    525.1µs
+pg       get          10,000        1.24s      8,077    122.7µs    136.8µs    148.8µs
+pg       list            100      126.1ms        793      1.3ms      1.3ms      1.3ms
+pg       dedup        10,000        3.98s      2,515    392.5µs    427.5µs    469.2µs
+```
+
+What the numbers say:
+
+| Op | Winner | Margin | Why |
+|---|---|---|---|
+| **put** | PG | ~12× | LMDB fsyncs the WAL on every commit (4 ms p50 on APFS). PG batches via its own WAL and the per-op commit cost amortizes better. |
+| **dedup put** | PG | ~8× | Same story — LMDB's transaction commit dominates even when the dedup path skips two writes. |
+| **get** | LMDB | ~50× | Mmap'd page lookup (~2 µs) vs. Postgres protocol roundtrip over a UNIX socket (~120 µs). The socket floor. |
+| **list_session** | LMDB | ~14× | In-process BTree walk vs. an indexed range scan plus protocol serialization. |
+
+**Caveat on the LMDB write number.** The current `LmdbStore::put` opens a fresh write transaction per block — that is what the `BlockStore` trait shape encourages, but it is the LMDB worst case. With batched commits (many puts per transaction) LMDB outpaces Postgres on writes by an order of magnitude. The numbers above reflect the trait as it stands, not LMDB's upper bound.
+
+**Caveat on the PG read numbers.** Reads go over a local Unix socket here. Across a real network with a few ms RTT, PG `get` and `list` latencies grow accordingly. The relative ordering doesn't change, but the absolute floor moves.
+
+The bench binary is parameterised; run your own:
+
+```
+cargo build --release -p llm386-store-bench
+./target/release/store-bench \
+    --pg-url postgres://user@host/db \
+    --blocks 10000 --bytes 1024 \
+    --workloads put,get,list,dedup \
+    --backends lmdb,pg
+```
 
 ## Why
 
@@ -381,6 +497,8 @@ The example's [README](./examples/langgraph-agent/README.md) has the full breakd
 crates/
   llm386-core                 types and trait seams (incl. Edge, Selection, Reducer)
   llm386-store-lmdb           LMDB BlockStore impl, edges_from / edges_to indexes
+  llm386-store-pg             PostgreSQL BlockStore impl (this fork)
+  llm386-store-bench          perf hammer that runs identical workloads against both stores
   llm386-tokenizer            tiktoken + HuggingFace tokenizer adapters, registry, LRU cache
   llm386-pager                GreedyPager, SectionBudgetTable, retrievers, edge-aware inclusion
   llm386-packer               SimplePacker (string and chat-message rendering)
@@ -397,14 +515,14 @@ The dependency direction is one-way: every impl crate depends on `llm386-core` f
 
 ## Status
 
-Early. The single-node embedded library and CLI work end to end against real LMDB and real tokenizers. Interfaces are stable enough for downstream consumers to build on, but expect breaking changes as new retrievers, summarizers, and storage backends land.
+Early. The single-node embedded library and CLI work end to end against real LMDB and real tokenizers. The Postgres backend in this fork is feature-complete against the `BlockStore` trait (full parity with LMDB including `delete`, `purge_session`, `list_sessions`, edges in both directions) and is exercised by an integration test suite gated on `TEST_DATABASE_URL`. The bundled CLI and Python SDK still default to LMDB; selecting the PG backend is currently a library-level concern. Interfaces are stable enough for downstream consumers to build on, but expect breaking changes as new retrievers, summarizers, and storage backends land.
 
 ## Non-goals
 
 - Hosting a chat UI.
 - Hiding state inside prompts.
 - Treating the model as the source of truth.
-- Distributed storage in the initial version.
+- A custom distributed storage layer (sharding, replication, consensus). The Postgres backend rides on Postgres's own primary-replica story; LMDB stays single-host.
 
 ## See also
 
