@@ -11,7 +11,7 @@ use llm386_core::{
 };
 use postgres::NoTls;
 use postgres::types::ToSql;
-use r2d2::{CustomizeConnection, Pool, PooledConnection};
+use r2d2::{CustomizeConnection, ManageConnection, Pool};
 use r2d2_postgres::PostgresConnectionManager;
 use tracing::{debug, instrument};
 
@@ -20,22 +20,41 @@ use crate::common::{
     decode_block_id, edge_kind_from_str, edge_kind_to_str, id_bytes, is_valid_ident,
     provenance_to_json, row_to_block, session_bytes, token_counts_to_json, ts_to_i64,
 };
+use crate::tls::{TlsBackend, build_backend};
 
-type PgPool = Pool<PostgresConnectionManager<NoTls>>;
-type PgConn = PooledConnection<PostgresConnectionManager<NoTls>>;
+/// Pool wrapper that holds either a plaintext or TLS pool, so the
+/// `BlockStore` impl can stay backend-agnostic via
+/// [`PgStore::with_conn`]. r2d2 makes the `PooledConnection` type
+/// generic over the manager, so the two variants have different
+/// concrete connection types — but both deref to
+/// `postgres::Client`, which is what every method body actually uses.
+#[derive(Clone)]
+enum PoolHandle {
+    Plain(Pool<PostgresConnectionManager<NoTls>>),
+    #[cfg(feature = "tls-native-tls")]
+    Tls(Pool<PostgresConnectionManager<postgres_native_tls::MakeTlsConnector>>),
+}
 
 /// Synchronous PostgreSQL-backed implementation of the `BlockStore` trait.
 ///
 /// Cheap to clone (clones share the underlying r2d2 pool).
 #[derive(Clone)]
 pub struct PgStore {
-    pool: PgPool,
+    pool: PoolHandle,
 }
 
 impl std::fmt::Debug for PgStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PgStore")
             .field("schema", &CURRENT_SCHEMA)
+            .field(
+                "tls",
+                &match &self.pool {
+                    PoolHandle::Plain(_) => "disable",
+                    #[cfg(feature = "tls-native-tls")]
+                    PoolHandle::Tls(_) => "native-tls",
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -43,13 +62,25 @@ impl std::fmt::Debug for PgStore {
 impl PgStore {
     /// Connect to `url` and prepare the schema. Idempotent: subsequent
     /// opens against the same database reuse the existing tables.
-    #[instrument(skip(config), fields(schema = ?config.schema))]
+    ///
+    /// `config.tls` controls transport security. The default is
+    /// [`crate::TlsMode::Disable`] (plaintext) for back-compat;
+    /// production deployments should set [`crate::TlsMode::Require`] or
+    /// stronger. Modes other than `Disable` require the
+    /// `tls-native-tls` cargo feature; building without it makes
+    /// non-`Disable` modes return [`StoreOpenError::TlsUnsupported`]
+    /// — never a silent fallback to plaintext.
+    #[instrument(skip(config), fields(schema = ?config.schema, tls = ?config.tls))]
     pub fn open(url: &str, config: &PgStoreConfig) -> Result<Self, StoreOpenError> {
         if let Some(schema) = &config.schema
             && !is_valid_ident(schema)
         {
             return Err(StoreOpenError::InvalidSchemaName(schema.clone()));
         }
+
+        // Build the TLS connector once and reuse it for the bootstrap
+        // connection and every pool connection.
+        let tls = build_backend(&config.tls)?;
 
         // Bootstrap (CREATE SCHEMA + migrations + schema-version
         // check) on a single dedicated connection *before* the pool
@@ -63,391 +94,405 @@ impl PgStore {
         // the bootstrap connection is closed and the pool is built,
         // ongoing operations don't issue DDL, so the lock is never
         // touched on the hot path.
-        bootstrap_and_migrate(url, config.schema.as_deref())?;
+        bootstrap_and_migrate(url, config.schema.as_deref(), &tls)?;
 
-        let manager = PostgresConnectionManager::new(
-            url.parse().map_err(|e: postgres::Error| {
-                StoreOpenError::Connect(format!("invalid Postgres URL: {e}"))
-            })?,
-            NoTls,
-        );
-
-        let mut builder = Pool::builder().max_size(config.max_pool_size);
-        if let Some(schema) = config.schema.clone() {
-            builder = builder.connection_customizer(Box::new(SearchPathCustomizer { schema }));
-        }
-        let pool = builder
-            .build(manager)
-            .map_err(|e| StoreOpenError::Connect(format!("r2d2 pool: {e}")))?;
+        let pool = build_pool(url, config.max_pool_size, config.schema.as_deref(), tls)?;
         debug!(schema = CURRENT_SCHEMA, "PgStore ready");
-
         Ok(Self { pool })
     }
 
-    fn conn(&self) -> Result<PgConn, StoreError> {
-        self.pool
-            .get()
-            .map_err(|e| StoreError::Backend(format!("pool checkout: {e}")))
+    /// Check out a connection and hand it to `f` as `&mut
+    /// postgres::Client`, dispatching on whichever pool variant is
+    /// active. Every `BlockStore` method goes through this — the
+    /// alternative (returning a `PooledConnection<...>` directly)
+    /// would expose the pool's TLS-flavored generic types in the
+    /// method signatures.
+    fn with_conn<R, F>(&self, f: F) -> Result<R, StoreError>
+    where
+        F: FnOnce(&mut postgres::Client) -> Result<R, StoreError>,
+    {
+        match &self.pool {
+            PoolHandle::Plain(p) => {
+                let mut c = p
+                    .get()
+                    .map_err(|e| StoreError::Backend(format!("pool checkout: {e}")))?;
+                f(&mut c)
+            }
+            #[cfg(feature = "tls-native-tls")]
+            PoolHandle::Tls(p) => {
+                let mut c = p
+                    .get()
+                    .map_err(|e| StoreError::Backend(format!("pool checkout: {e}")))?;
+                f(&mut c)
+            }
+        }
     }
 }
 
 impl BlockStore for PgStore {
     #[instrument(skip(self, block), fields(id = %block.id, kind = ?block.kind))]
     fn put(&self, session: SessionId, block: ContextBlock) -> Result<BlockId, StoreError> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .transaction()
-            .map_err(|e| StoreError::Backend(format!("begin tx: {e}")))?;
+        self.with_conn(|conn| {
+            let mut tx = conn
+                .transaction()
+                .map_err(|e| StoreError::Backend(format!("begin tx: {e}")))?;
 
-        let proposed_id = id_bytes(block.id);
-        let hash_bytes = block.hash.0.to_vec();
-        let kind_str = block_kind_to_str(block.kind);
-        let token_counts_json = token_counts_to_json(&block.token_counts);
-        let provenance_json = provenance_to_json(&block.provenance);
-        let created_at_i64 = ts_to_i64(block.created_at);
-        let updated_at_i64 = ts_to_i64(block.updated_at);
-        let priority_f32 = block.priority;
+            let proposed_id = id_bytes(block.id);
+            let hash_bytes = block.hash.0.to_vec();
+            let kind_str = block_kind_to_str(block.kind);
+            let token_counts_json = token_counts_to_json(&block.token_counts);
+            let provenance_json = provenance_to_json(&block.provenance);
+            let created_at_i64 = ts_to_i64(block.created_at);
+            let updated_at_i64 = ts_to_i64(block.updated_at);
+            let priority_f32 = block.priority;
 
-        let params: &[&(dyn ToSql + Sync)] = &[
-            &proposed_id.as_slice(),
-            &kind_str,
-            &block.bytes,
-            &token_counts_json,
-            &priority_f32,
-            &created_at_i64,
-            &updated_at_i64,
-            &provenance_json,
-            &hash_bytes.as_slice(),
-        ];
+            let params: &[&(dyn ToSql + Sync)] = &[
+                &proposed_id.as_slice(),
+                &kind_str,
+                &block.bytes,
+                &token_counts_json,
+                &priority_f32,
+                &created_at_i64,
+                &updated_at_i64,
+                &provenance_json,
+                &hash_bytes.as_slice(),
+            ];
 
-        // Single-statement UPSERT: on conflict, lock the existing
-        // row and return its id; on no conflict, insert and return
-        // the new id. Using DO UPDATE (with a no-op SET that doesn't
-        // change any observable field) acquires the conflict row's
-        // lock atomically with the conflict detection, which closes
-        // the TOCTOU window a separate fallback SELECT would leave
-        // open under READ COMMITTED — a concurrent committed delete
-        // can't vaporize the row between conflict detection and the
-        // SELECT. The `SET hash = llm386_blocks.hash` is a no-op
-        // value-wise (matches LMDB's "dedup does not mutate the
-        // existing block" contract) but still causes Postgres to lock
-        // the row and emit RETURNING, which is what we need.
-        let row = tx
-            .query_one(
-                "INSERT INTO llm386_blocks
-                    (id, kind, bytes, token_counts, priority,
-                     created_at, updated_at, provenance, hash)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (hash) DO UPDATE SET hash = llm386_blocks.hash
-                 RETURNING id",
-                params,
+            // Single-statement UPSERT: on conflict, lock the existing
+            // row and return its id; on no conflict, insert and return
+            // the new id. Using DO UPDATE (with a no-op SET that doesn't
+            // change any observable field) acquires the conflict row's
+            // lock atomically with the conflict detection, which closes
+            // the TOCTOU window a separate fallback SELECT would leave
+            // open under READ COMMITTED — a concurrent committed delete
+            // can't vaporize the row between conflict detection and the
+            // SELECT. The `SET hash = llm386_blocks.hash` is a no-op
+            // value-wise (matches LMDB's "dedup does not mutate the
+            // existing block" contract) but still causes Postgres to lock
+            // the row and emit RETURNING, which is what we need.
+            let row = tx
+                .query_one(
+                    "INSERT INTO llm386_blocks
+                        (id, kind, bytes, token_counts, priority,
+                         created_at, updated_at, provenance, hash)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (hash) DO UPDATE SET hash = llm386_blocks.hash
+                     RETURNING id",
+                    params,
+                )
+                .map_err(|e| StoreError::Backend(format!("insert block: {e}")))?;
+            let stored_id = {
+                let bytes: &[u8] = row.get(0);
+                let id = decode_block_id(bytes)?;
+                if id != block.id {
+                    debug!(?id, "deduped on content hash");
+                }
+                id
+            };
+
+            tx.execute(
+                "INSERT INTO llm386_session_blocks (session_id, block_id)
+                 VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING",
+                &[&session_bytes(session).as_slice(), &id_bytes(stored_id).as_slice()],
             )
-            .map_err(|e| StoreError::Backend(format!("insert block: {e}")))?;
-        let stored_id = {
-            let bytes: &[u8] = row.get(0);
-            let id = decode_block_id(bytes)?;
-            if id != block.id {
-                debug!(?id, "deduped on content hash");
-            }
-            id
-        };
+            .map_err(|e| StoreError::Backend(format!("insert session_block: {e}")))?;
 
-        tx.execute(
-            "INSERT INTO llm386_session_blocks (session_id, block_id)
-             VALUES ($1, $2)
-             ON CONFLICT DO NOTHING",
-            &[&session_bytes(session).as_slice(), &id_bytes(stored_id).as_slice()],
-        )
-        .map_err(|e| StoreError::Backend(format!("insert session_block: {e}")))?;
-
-        tx.commit()
-            .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
-        Ok(stored_id)
+            tx.commit()
+                .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
+            Ok(stored_id)
+        })
     }
 
     fn get(&self, id: BlockId) -> Result<Option<ContextBlock>, StoreError> {
-        let mut conn = self.conn()?;
-        let row = conn
-            .query_opt(
-                "SELECT id, kind, bytes, token_counts, priority,
-                        created_at, updated_at, provenance, hash
-                 FROM llm386_blocks WHERE id = $1",
-                &[&id_bytes(id).as_slice()],
-            )
-            .map_err(|e| StoreError::Backend(format!("get block: {e}")))?;
-        match row {
-            Some(r) => Ok(Some(row_to_block(&r)?)),
-            None => Ok(None),
-        }
+        self.with_conn(|conn| {
+            let row = conn
+                .query_opt(
+                    "SELECT id, kind, bytes, token_counts, priority,
+                            created_at, updated_at, provenance, hash
+                     FROM llm386_blocks WHERE id = $1",
+                    &[&id_bytes(id).as_slice()],
+                )
+                .map_err(|e| StoreError::Backend(format!("get block: {e}")))?;
+            match row {
+                Some(r) => Ok(Some(row_to_block(&r)?)),
+                None => Ok(None),
+            }
+        })
     }
 
     fn list_session(&self, session: SessionId) -> Result<Vec<BlockId>, StoreError> {
-        let mut conn = self.conn()?;
-        let rows = conn
-            .query(
-                "SELECT block_id FROM llm386_session_blocks
-                 WHERE session_id = $1 ORDER BY block_id ASC",
-                &[&session_bytes(session).as_slice()],
-            )
-            .map_err(|e| StoreError::Backend(format!("list_session: {e}")))?;
-        let mut ids = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let bytes: &[u8] = row.get(0);
-            ids.push(decode_block_id(bytes)?);
-        }
-        Ok(ids)
+        self.with_conn(|conn| {
+            let rows = conn
+                .query(
+                    "SELECT block_id FROM llm386_session_blocks
+                     WHERE session_id = $1 ORDER BY block_id ASC",
+                    &[&session_bytes(session).as_slice()],
+                )
+                .map_err(|e| StoreError::Backend(format!("list_session: {e}")))?;
+            let mut ids = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let bytes: &[u8] = row.get(0);
+                ids.push(decode_block_id(bytes)?);
+            }
+            Ok(ids)
+        })
     }
 
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
-        let mut conn = self.conn()?;
-        let rows = conn
-            .query(
-                "SELECT DISTINCT session_id FROM llm386_session_blocks
-                 ORDER BY session_id ASC",
-                &[],
-            )
-            .map_err(|e| StoreError::Backend(format!("list_sessions: {e}")))?;
-        let mut sessions = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let bytes: &[u8] = row.get(0);
-            let id = decode_block_id(bytes)?;
-            sessions.push(SessionId(id.0));
-        }
-        Ok(sessions)
+        self.with_conn(|conn| {
+            let rows = conn
+                .query(
+                    "SELECT DISTINCT session_id FROM llm386_session_blocks
+                     ORDER BY session_id ASC",
+                    &[],
+                )
+                .map_err(|e| StoreError::Backend(format!("list_sessions: {e}")))?;
+            let mut sessions = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let bytes: &[u8] = row.get(0);
+                let id = decode_block_id(bytes)?;
+                sessions.push(SessionId(id.0));
+            }
+            Ok(sessions)
+        })
     }
 
     fn lookup_hash(&self, hash: ContentHash) -> Result<Option<BlockId>, StoreError> {
-        let mut conn = self.conn()?;
-        let row = conn
-            .query_opt(
-                "SELECT id FROM llm386_blocks WHERE hash = $1",
-                &[&hash.0.as_slice()],
-            )
-            .map_err(|e| StoreError::Backend(format!("lookup_hash: {e}")))?;
-        match row {
-            Some(r) => {
-                let bytes: &[u8] = r.get(0);
-                Ok(Some(decode_block_id(bytes)?))
+        self.with_conn(|conn| {
+            let row = conn
+                .query_opt(
+                    "SELECT id FROM llm386_blocks WHERE hash = $1",
+                    &[&hash.0.as_slice()],
+                )
+                .map_err(|e| StoreError::Backend(format!("lookup_hash: {e}")))?;
+            match row {
+                Some(r) => {
+                    let bytes: &[u8] = r.get(0);
+                    Ok(Some(decode_block_id(bytes)?))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
     }
 
     #[instrument(skip(self), fields(id = %id))]
     fn delete(&self, id: BlockId) -> Result<bool, StoreError> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .transaction()
-            .map_err(|e| StoreError::Backend(format!("begin tx: {e}")))?;
+        self.with_conn(|conn| {
+            let mut tx = conn
+                .transaction()
+                .map_err(|e| StoreError::Backend(format!("begin tx: {e}")))?;
 
-        let id_b = id_bytes(id);
-        let id_slice: &[u8] = id_b.as_slice();
+            let id_b = id_bytes(id);
+            let id_slice: &[u8] = id_b.as_slice();
 
-        // Lock order matters: `put`'s ON CONFLICT DO UPDATE takes a
-        // row lock on `llm386_blocks.id` *before* it inserts into
-        // `llm386_session_blocks`. Delete must acquire the same row
-        // lock first so concurrent put + delete on the same block
-        // can't deadlock (delete-then-blocks would otherwise hold
-        // session_blocks rows while waiting on blocks.id, while put
-        // holds blocks.id and waits to write session_blocks).
-        let block_deleted = tx
-            .execute(
-                "DELETE FROM llm386_blocks WHERE id = $1",
+            // Lock order matters: `put`'s ON CONFLICT DO UPDATE takes a
+            // row lock on `llm386_blocks.id` *before* it inserts into
+            // `llm386_session_blocks`. Delete must acquire the same row
+            // lock first so concurrent put + delete on the same block
+            // can't deadlock (delete-then-blocks would otherwise hold
+            // session_blocks rows while waiting on blocks.id, while put
+            // holds blocks.id and waits to write session_blocks).
+            let block_deleted = tx
+                .execute("DELETE FROM llm386_blocks WHERE id = $1", &[&id_slice])
+                .map_err(|e| StoreError::Backend(format!("delete block: {e}")))?;
+            let sessions_deleted = tx
+                .execute(
+                    "DELETE FROM llm386_session_blocks WHERE block_id = $1",
+                    &[&id_slice],
+                )
+                .map_err(|e| StoreError::Backend(format!("delete session refs: {e}")))?;
+            tx.execute(
+                "DELETE FROM llm386_edges WHERE from_id = $1 OR to_id = $1",
                 &[&id_slice],
             )
-            .map_err(|e| StoreError::Backend(format!("delete block: {e}")))?;
-        let sessions_deleted = tx
-            .execute(
-                "DELETE FROM llm386_session_blocks WHERE block_id = $1",
-                &[&id_slice],
-            )
-            .map_err(|e| StoreError::Backend(format!("delete session refs: {e}")))?;
-        tx.execute(
-            "DELETE FROM llm386_edges WHERE from_id = $1 OR to_id = $1",
-            &[&id_slice],
-        )
-        .map_err(|e| StoreError::Backend(format!("delete edges: {e}")))?;
+            .map_err(|e| StoreError::Backend(format!("delete edges: {e}")))?;
 
-        tx.commit()
-            .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
+            tx.commit()
+                .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
 
-        let existed = block_deleted > 0 || sessions_deleted > 0;
-        if existed {
-            debug!(?id, sessions = sessions_deleted, "block deleted");
-        }
-        Ok(existed)
+            let existed = block_deleted > 0 || sessions_deleted > 0;
+            if existed {
+                debug!(?id, sessions = sessions_deleted, "block deleted");
+            }
+            Ok(existed)
+        })
     }
 
     #[instrument(skip(self), fields(session = %session))]
     fn purge_session(&self, session: SessionId) -> Result<usize, StoreError> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .transaction()
-            .map_err(|e| StoreError::Backend(format!("begin tx: {e}")))?;
+        self.with_conn(|conn| {
+            let mut tx = conn
+                .transaction()
+                .map_err(|e| StoreError::Backend(format!("begin tx: {e}")))?;
 
-        let session_b = session_bytes(session);
-        let session_slice: &[u8] = session_b.as_slice();
+            let session_b = session_bytes(session);
+            let session_slice: &[u8] = session_b.as_slice();
 
-        // Step 1: collect every block id this session references.
-        let rows = tx
-            .query(
-                "SELECT block_id FROM llm386_session_blocks WHERE session_id = $1",
-                &[&session_slice],
-            )
-            .map_err(|e| StoreError::Backend(format!("collect session blocks: {e}")))?;
-        let block_ids: Vec<BlockId> = rows
-            .iter()
-            .map(|r| {
-                let b: &[u8] = r.get(0);
-                decode_block_id(b)
-            })
-            .collect::<Result<_, _>>()?;
-        let count = block_ids.len();
-        if count == 0 {
-            tx.commit()
-                .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
-            return Ok(0);
-        }
+            // Step 1: collect every block id this session references.
+            let rows = tx
+                .query(
+                    "SELECT block_id FROM llm386_session_blocks WHERE session_id = $1",
+                    &[&session_slice],
+                )
+                .map_err(|e| StoreError::Backend(format!("collect session blocks: {e}")))?;
+            let block_ids: Vec<BlockId> = rows
+                .iter()
+                .map(|r| {
+                    let b: &[u8] = r.get(0);
+                    decode_block_id(b)
+                })
+                .collect::<Result<_, _>>()?;
+            let count = block_ids.len();
+            if count == 0 {
+                tx.commit()
+                    .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
+                return Ok(0);
+            }
 
-        // Materialize id bytes once; reused below as $2 parameters.
-        let id_byte_bufs: Vec<Vec<u8>> = block_ids
-            .iter()
-            .map(|id| id_bytes(*id).to_vec())
-            .collect();
-        let id_slices: Vec<&[u8]> = id_byte_bufs.iter().map(Vec::as_slice).collect();
+            // Materialize id bytes once; reused below as $2 parameters.
+            let id_byte_bufs: Vec<Vec<u8>> = block_ids
+                .iter()
+                .map(|id| id_bytes(*id).to_vec())
+                .collect();
+            let id_slices: Vec<&[u8]> = id_byte_bufs.iter().map(Vec::as_slice).collect();
 
-        // Step 2: lock every session_blocks row that references any
-        // of these block ids — including rows for OTHER sessions
-        // sharing the block. This is the fix for the orphan-leak race
-        // a naive READ COMMITTED implementation has: without this
-        // lock, two concurrent purge_session calls on overlapping
-        // shared blocks both see each other's uncommitted deletes as
-        // "still alive" in their orphan checks, both skip the block
-        // delete, and the block leaks. With the lock, the loser
-        // blocks here until the winner commits, then re-evaluates
-        // and correctly sees the block as unreferenced.
-        tx.execute(
-            "SELECT 1 FROM llm386_session_blocks
-             WHERE block_id = ANY($1)
-             FOR UPDATE",
-            &[&id_slices],
-        )
-        .map_err(|e| StoreError::Backend(format!("lock session refs: {e}")))?;
-
-        // Step 3: drop this session's references.
-        tx.execute(
-            "DELETE FROM llm386_session_blocks WHERE session_id = $1",
-            &[&session_slice],
-        )
-        .map_err(|e| StoreError::Backend(format!("delete session refs: {e}")))?;
-
-        // Step 4: find which of those blocks are now orphans. Done in
-        // one query rather than N+1 separate EXISTS round-trips.
-        let orphan_rows = tx
-            .query(
-                "SELECT id FROM llm386_blocks
-                 WHERE id = ANY($1)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM llm386_session_blocks sb
-                     WHERE sb.block_id = llm386_blocks.id
-                   )",
+            // Step 2: lock every session_blocks row that references any
+            // of these block ids — including rows for OTHER sessions
+            // sharing the block. This is the fix for the orphan-leak race
+            // a naive READ COMMITTED implementation has: without this
+            // lock, two concurrent purge_session calls on overlapping
+            // shared blocks both see each other's uncommitted deletes as
+            // "still alive" in their orphan checks, both skip the block
+            // delete, and the block leaks. With the lock, the loser
+            // blocks here until the winner commits, then re-evaluates
+            // and correctly sees the block as unreferenced.
+            tx.execute(
+                "SELECT 1 FROM llm386_session_blocks
+                 WHERE block_id = ANY($1)
+                 FOR UPDATE",
                 &[&id_slices],
             )
-            .map_err(|e| StoreError::Backend(format!("collect orphans: {e}")))?;
-        let orphan_byte_bufs: Vec<Vec<u8>> = orphan_rows
-            .iter()
-            .map(|r| {
-                let b: &[u8] = r.get(0);
-                b.to_vec()
-            })
-            .collect();
+            .map_err(|e| StoreError::Backend(format!("lock session refs: {e}")))?;
 
-        // Step 5: scrub edges + blocks for the orphan set in two
-        // statements, regardless of how many orphans there are.
-        if !orphan_byte_bufs.is_empty() {
-            let orphan_slices: Vec<&[u8]> =
-                orphan_byte_bufs.iter().map(Vec::as_slice).collect();
+            // Step 3: drop this session's references.
             tx.execute(
-                "DELETE FROM llm386_edges
-                 WHERE from_id = ANY($1) OR to_id = ANY($1)",
-                &[&orphan_slices],
+                "DELETE FROM llm386_session_blocks WHERE session_id = $1",
+                &[&session_slice],
             )
-            .map_err(|e| StoreError::Backend(format!("delete orphan edges: {e}")))?;
-            tx.execute(
-                "DELETE FROM llm386_blocks WHERE id = ANY($1)",
-                &[&orphan_slices],
-            )
-            .map_err(|e| StoreError::Backend(format!("delete orphan blocks: {e}")))?;
-        }
+            .map_err(|e| StoreError::Backend(format!("delete session refs: {e}")))?;
 
-        tx.commit()
-            .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
-        Ok(count)
+            // Step 4: find which of those blocks are now orphans. Done in
+            // one query rather than N+1 separate EXISTS round-trips.
+            let orphan_rows = tx
+                .query(
+                    "SELECT id FROM llm386_blocks
+                     WHERE id = ANY($1)
+                       AND NOT EXISTS (
+                         SELECT 1 FROM llm386_session_blocks sb
+                         WHERE sb.block_id = llm386_blocks.id
+                       )",
+                    &[&id_slices],
+                )
+                .map_err(|e| StoreError::Backend(format!("collect orphans: {e}")))?;
+            let orphan_byte_bufs: Vec<Vec<u8>> = orphan_rows
+                .iter()
+                .map(|r| {
+                    let b: &[u8] = r.get(0);
+                    b.to_vec()
+                })
+                .collect();
+
+            // Step 5: scrub edges + blocks for the orphan set in two
+            // statements, regardless of how many orphans there are.
+            if !orphan_byte_bufs.is_empty() {
+                let orphan_slices: Vec<&[u8]> =
+                    orphan_byte_bufs.iter().map(Vec::as_slice).collect();
+                tx.execute(
+                    "DELETE FROM llm386_edges
+                     WHERE from_id = ANY($1) OR to_id = ANY($1)",
+                    &[&orphan_slices],
+                )
+                .map_err(|e| StoreError::Backend(format!("delete orphan edges: {e}")))?;
+                tx.execute(
+                    "DELETE FROM llm386_blocks WHERE id = ANY($1)",
+                    &[&orphan_slices],
+                )
+                .map_err(|e| StoreError::Backend(format!("delete orphan blocks: {e}")))?;
+            }
+
+            tx.commit()
+                .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;
+            Ok(count)
+        })
     }
 
     fn put_edge(&self, edge: Edge) -> Result<(), StoreError> {
-        let mut conn = self.conn()?;
-        let kind_str = edge_kind_to_str(edge.kind);
-        let from_b = id_bytes(edge.from);
-        let to_b = id_bytes(edge.to);
-        conn.execute(
-            "INSERT INTO llm386_edges (from_id, kind, to_id)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (from_id, kind, to_id) DO NOTHING",
-            &[&from_b.as_slice(), &kind_str, &to_b.as_slice()],
-        )
-        .map_err(|e| StoreError::Backend(format!("put_edge: {e}")))?;
-        Ok(())
+        self.with_conn(|conn| {
+            let kind_str = edge_kind_to_str(edge.kind);
+            let from_b = id_bytes(edge.from);
+            let to_b = id_bytes(edge.to);
+            conn.execute(
+                "INSERT INTO llm386_edges (from_id, kind, to_id)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (from_id, kind, to_id) DO NOTHING",
+                &[&from_b.as_slice(), &kind_str, &to_b.as_slice()],
+            )
+            .map_err(|e| StoreError::Backend(format!("put_edge: {e}")))?;
+            Ok(())
+        })
     }
 
     fn edges_from(&self, from: BlockId) -> Result<Vec<Edge>, StoreError> {
-        let mut conn = self.conn()?;
-        let rows = conn
-            .query(
-                "SELECT to_id, kind FROM llm386_edges
-                 WHERE from_id = $1 ORDER BY kind, to_id",
-                &[&id_bytes(from).as_slice()],
-            )
-            .map_err(|e| StoreError::Backend(format!("edges_from: {e}")))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let to_b: &[u8] = r.get(0);
-            let kind_str: &str = r.get(1);
-            out.push(Edge {
-                from,
-                to: decode_block_id(to_b)?,
-                kind: edge_kind_from_str(kind_str)?,
-            });
-        }
-        Ok(out)
+        self.with_conn(|conn| {
+            let rows = conn
+                .query(
+                    "SELECT to_id, kind FROM llm386_edges
+                     WHERE from_id = $1 ORDER BY kind, to_id",
+                    &[&id_bytes(from).as_slice()],
+                )
+                .map_err(|e| StoreError::Backend(format!("edges_from: {e}")))?;
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let to_b: &[u8] = r.get(0);
+                let kind_str: &str = r.get(1);
+                out.push(Edge {
+                    from,
+                    to: decode_block_id(to_b)?,
+                    kind: edge_kind_from_str(kind_str)?,
+                });
+            }
+            Ok(out)
+        })
     }
 
     fn edges_to(&self, to: BlockId) -> Result<Vec<Edge>, StoreError> {
-        let mut conn = self.conn()?;
-        let rows = conn
-            .query(
-                "SELECT from_id, kind FROM llm386_edges
-                 WHERE to_id = $1 ORDER BY kind, from_id",
-                &[&id_bytes(to).as_slice()],
-            )
-            .map_err(|e| StoreError::Backend(format!("edges_to: {e}")))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let from_b: &[u8] = r.get(0);
-            let kind_str: &str = r.get(1);
-            out.push(Edge {
-                from: decode_block_id(from_b)?,
-                to,
-                kind: edge_kind_from_str(kind_str)?,
-            });
-        }
-        Ok(out)
+        self.with_conn(|conn| {
+            let rows = conn
+                .query(
+                    "SELECT from_id, kind FROM llm386_edges
+                     WHERE to_id = $1 ORDER BY kind, from_id",
+                    &[&id_bytes(to).as_slice()],
+                )
+                .map_err(|e| StoreError::Backend(format!("edges_to: {e}")))?;
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let from_b: &[u8] = r.get(0);
+                let kind_str: &str = r.get(1);
+                out.push(Edge {
+                    from: decode_block_id(from_b)?,
+                    to,
+                    kind: edge_kind_from_str(kind_str)?,
+                });
+            }
+            Ok(out)
+        })
     }
 }
 
 /// Per-connection setup: scope every checked-out connection to the
 /// configured schema. Idempotent and race-free — the schema itself
-/// is created up-front by [`bootstrap_schema`].
+/// is created up-front by [`bootstrap_and_migrate`].
 #[derive(Debug)]
 struct SearchPathCustomizer {
     schema: String,
@@ -461,6 +506,104 @@ impl CustomizeConnection<postgres::Client, postgres::Error> for SearchPathCustom
     }
 }
 
+/// Wire the schema customizer onto a pool builder if a schema was
+/// configured. Generic over the manager so the same helper builds
+/// both NoTls and TLS-flavored pools.
+fn add_search_path_customizer<M>(
+    builder: r2d2::Builder<M>,
+    schema: Option<&str>,
+) -> r2d2::Builder<M>
+where
+    M: ManageConnection<Connection = postgres::Client, Error = postgres::Error>,
+{
+    if let Some(schema) = schema {
+        builder.connection_customizer(Box::new(SearchPathCustomizer {
+            schema: schema.to_string(),
+        }))
+    } else {
+        builder
+    }
+}
+
+/// Build the appropriate pool variant for the configured TLS backend.
+fn build_pool(
+    url: &str,
+    max_pool_size: u32,
+    schema: Option<&str>,
+    tls: TlsBackend,
+) -> Result<PoolHandle, StoreOpenError> {
+    let pg_config = pg_config_with_ssl_mode(url, &tls)?;
+    match tls {
+        TlsBackend::Plain => {
+            let manager = PostgresConnectionManager::new(pg_config, NoTls);
+            let builder = add_search_path_customizer(
+                Pool::builder().max_size(max_pool_size),
+                schema,
+            );
+            let pool = builder
+                .build(manager)
+                .map_err(|e| StoreOpenError::Connect(format!("r2d2 pool: {e}")))?;
+            Ok(PoolHandle::Plain(pool))
+        }
+        #[cfg(feature = "tls-native-tls")]
+        TlsBackend::Native(connector) => {
+            let mts = postgres_native_tls::MakeTlsConnector::new(connector);
+            let manager = PostgresConnectionManager::new(pg_config, mts);
+            let builder = add_search_path_customizer(
+                Pool::builder().max_size(max_pool_size),
+                schema,
+            );
+            let pool = builder
+                .build(manager)
+                .map_err(|e| StoreOpenError::Connect(format!("r2d2 pool: {e}")))?;
+            Ok(PoolHandle::Tls(pool))
+        }
+    }
+}
+
+/// Open a fresh `postgres::Client` (outside any pool) with the given
+/// TLS backend. Used by [`bootstrap_and_migrate`] for the dedicated
+/// bootstrap connection.
+fn connect_client(url: &str, tls: &TlsBackend) -> Result<postgres::Client, StoreOpenError> {
+    let pg_config = pg_config_with_ssl_mode(url, tls)?;
+    match tls {
+        TlsBackend::Plain => pg_config
+            .connect(NoTls)
+            .map_err(|e| StoreOpenError::Connect(format!("bootstrap connection: {e}"))),
+        #[cfg(feature = "tls-native-tls")]
+        TlsBackend::Native(connector) => {
+            let mts = postgres_native_tls::MakeTlsConnector::new(connector.clone());
+            pg_config
+                .connect(mts)
+                .map_err(|e| StoreOpenError::Connect(format!("bootstrap connection: {e}")))
+        }
+    }
+}
+
+/// Parse `url` into a `postgres::Config`, then force `sslmode` to
+/// match the configured `TlsBackend`. Without this, the default
+/// `sslmode=prefer` would let TLS-Require open silently fall back to
+/// plaintext if the server doesn't offer TLS — a violation of the
+/// `TlsMode::Require` contract.
+fn pg_config_with_ssl_mode(
+    url: &str,
+    tls: &TlsBackend,
+) -> Result<postgres::Config, StoreOpenError> {
+    let mut cfg: postgres::Config = url.parse().map_err(|e: postgres::Error| {
+        StoreOpenError::Connect(format!("invalid Postgres URL: {e}"))
+    })?;
+    match tls {
+        TlsBackend::Plain => {
+            cfg.ssl_mode(postgres::config::SslMode::Disable);
+        }
+        #[cfg(feature = "tls-native-tls")]
+        TlsBackend::Native(_) => {
+            cfg.ssl_mode(postgres::config::SslMode::Require);
+        }
+    }
+    Ok(cfg)
+}
+
 /// Bootstrap the schema + run migrations + verify version, on a
 /// fresh single-purpose connection, all under a Postgres advisory
 /// lock. The lock auto-releases on commit; subsequent opens find the
@@ -471,9 +614,12 @@ impl CustomizeConnection<postgres::Client, postgres::Error> for SearchPathCustom
 /// constant so they serialize against one another. Collisions with
 /// other unrelated application code using advisory locks are
 /// astronomically unlikely on a 64-bit space.
-fn bootstrap_and_migrate(url: &str, schema: Option<&str>) -> Result<(), StoreOpenError> {
-    let mut conn = postgres::Client::connect(url, NoTls)
-        .map_err(|e| StoreOpenError::Connect(format!("bootstrap connection: {e}")))?;
+fn bootstrap_and_migrate(
+    url: &str,
+    schema: Option<&str>,
+    tls: &TlsBackend,
+) -> Result<(), StoreOpenError> {
+    let mut conn = connect_client(url, tls)?;
     let mut tx = conn
         .transaction()
         .map_err(|e| StoreOpenError::Connect(format!("bootstrap begin: {e}")))?;
@@ -555,6 +701,7 @@ mod tests {
             &PgStoreConfig {
                 max_pool_size: 4,
                 schema: Some(schema.clone()),
+                tls: crate::TlsMode::Disable,
             },
         )
         .expect("open PgStore");

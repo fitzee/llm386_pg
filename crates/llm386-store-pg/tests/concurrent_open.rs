@@ -58,6 +58,7 @@ fn sync_concurrent_open_against_same_schema_all_succeed() {
                     &PgStoreConfig {
                         max_pool_size: 4,
                         schema: Some(schema),
+            ..Default::default()
                     },
                 )
             }));
@@ -142,6 +143,7 @@ mod async_open {
                             &PgStoreConfig {
                                 max_pool_size: 4,
                                 schema: Some(schema),
+            ..Default::default()
                             },
                         )
                         .await

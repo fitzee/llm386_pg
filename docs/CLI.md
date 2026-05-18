@@ -53,6 +53,25 @@ Subcommands that depend on backend-specific surface area (currently `verify` and
 
 For the decision of *which* backend to pick, see [FAQ → Should I use LMDB or Postgres?](../FAQ.md#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up).
 
+### TLS for the Postgres backend
+
+The Postgres URL alone says nothing about transport security — the CLI's default is plaintext (`tls = "disable"`). For any non-localhost deployment, set TLS in the `[store]` section of the `--profiles` TOML:
+
+```toml
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+tls     = "require"
+```
+
+The `llm386` binary needs to be built with the `tls-native-tls` feature for non-`disable` modes to work — install with:
+
+```
+cargo install --path crates/llm386-cli --features tls-native-tls
+```
+
+Without the feature, opening with `tls = "require"` fails loudly with `TlsUnsupported` rather than silently falling back to plaintext. Full TLS guide in the [README → TLS section](../README.md#tls), including `RequireCustomCa` for private CA bundles.
+
 ---
 
 ## Store lifecycle

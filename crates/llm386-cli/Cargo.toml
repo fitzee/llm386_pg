@@ -15,6 +15,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enable TLS (`tls = "require"` etc. in the `[store]` TOML section)
+# for the bundled CLI binary. Forwards through llm386-config to
+# llm386-store-pg.
+tls-native-tls = ["llm386-config/tls-native-tls"]
+
 [dependencies]
 llm386-core = { workspace = true }
 llm386-store-lmdb = { workspace = true }

@@ -18,6 +18,34 @@ pub(crate) const CURRENT_SCHEMA: i32 = 1;
 
 pub(crate) const DEFAULT_POOL_SIZE: u32 = 8;
 
+/// How to secure the Postgres connection. Default is [`TlsMode::Disable`]
+/// for back-compat; production deployments **should** opt in to
+/// [`TlsMode::Require`] (or stronger) unless the Postgres server runs
+/// on localhost or over a trusted private socket.
+///
+/// `Require` / `RequireCustomCa` need the `tls-native-tls` feature.
+/// Without it, opening with either mode returns
+/// [`StoreOpenError::TlsUnsupported`] — never silently downgrades.
+#[derive(Clone, Debug, Default)]
+pub enum TlsMode {
+    /// Plaintext connection. Only safe on localhost or a trusted
+    /// private network. This is the default for back-compat; explicit
+    /// opt-in for clarity.
+    #[default]
+    Disable,
+    /// Require TLS; verify the server certificate against the system
+    /// root CA store. Works out of the box with most managed Postgres
+    /// providers (RDS, Cloud SQL, Supabase, Neon).
+    Require,
+    /// Require TLS; verify the server certificate against a custom
+    /// PEM-encoded CA bundle. Use this when the server presents a
+    /// cert chain rooted at a private CA not in the system store.
+    RequireCustomCa {
+        /// Path to a PEM file containing one or more CA certificates.
+        ca_path: std::path::PathBuf,
+    },
+}
+
 /// Configuration shared by [`crate::PgStore`] and
 /// (with the `async` feature) [`crate::AsyncPgStore`].
 #[derive(Clone, Debug)]
@@ -29,6 +57,9 @@ pub struct PgStoreConfig {
     /// valid Postgres identifier: ASCII letters/digits/underscores only,
     /// and must start with a letter or underscore.
     pub schema: Option<String>,
+    /// TLS posture. Defaults to [`TlsMode::Disable`] for back-compat;
+    /// **set this explicitly for any non-localhost deployment**.
+    pub tls: TlsMode,
 }
 
 impl Default for PgStoreConfig {
@@ -36,6 +67,7 @@ impl Default for PgStoreConfig {
         Self {
             max_pool_size: DEFAULT_POOL_SIZE,
             schema: None,
+            tls: TlsMode::default(),
         }
     }
 }
@@ -53,6 +85,14 @@ pub enum StoreOpenError {
     CorruptMeta(String),
     #[error("invalid schema name `{0}`: must be ASCII [a-zA-Z_][a-zA-Z0-9_]*")]
     InvalidSchemaName(String),
+    #[error(
+        "TLS mode {0:?} requires the `tls-native-tls` feature; \
+         rebuild llm386-store-pg (or the consuming crate) with \
+         --features tls-native-tls, or set TlsMode::Disable"
+    )]
+    TlsUnsupported(TlsMode),
+    #[error("TLS configuration error: {0}")]
+    TlsConfig(String),
 }
 
 /// Full schema bootstrap. Idempotent — safe to issue on every open.

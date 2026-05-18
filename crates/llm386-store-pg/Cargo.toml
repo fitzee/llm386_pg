@@ -17,6 +17,13 @@ default = []
 # is always available; the async API is additional and inherent on its
 # own struct (it does not implement the sync BlockStore trait).
 async = ["dep:deadpool-postgres", "dep:tokio"]
+# TLS via native-tls (Schannel on Windows, Security framework on
+# macOS, OpenSSL on Linux). Enables `TlsMode::Require` and
+# `TlsMode::RequireCustomCa` on both PgStore and AsyncPgStore.
+# Without this feature, `TlsMode::Disable` is the only working mode
+# and the others return `StoreOpenError::TlsUnsupported` at open
+# time.
+tls-native-tls = ["dep:native-tls", "dep:postgres-native-tls"]
 
 [dependencies]
 llm386-core = { workspace = true }
@@ -33,6 +40,10 @@ r2d2_postgres = "0.18"
 deadpool-postgres = { version = "0.14", optional = true }
 tokio = { version = "1", features = ["rt", "macros"], optional = true }
 
+# TLS opt-in
+native-tls = { version = "0.2", optional = true }
+postgres-native-tls = { version = "0.5", optional = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 parking_lot = { workspace = true }
@@ -48,3 +59,8 @@ name = "concurrent_open"
 path = "tests/concurrent_open.rs"
 # Always compiles; the inner `mod async_open` is gated on the
 # `async` feature so the async test only runs when it's enabled.
+
+[[test]]
+name = "tls_require"
+path = "tests/tls_require.rs"
+required-features = ["tls-native-tls"]

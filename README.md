@@ -216,6 +216,70 @@ let (a, b, c) = tokio::try_join!(
 
 The two stores share the schema, the migration logic, and `PgStoreConfig` — they're interchangeable in terms of on-disk state. You can write through one and read through the other against the same database.
 
+### TLS
+
+The default is `TlsMode::Disable` (plaintext) for back-compat. **Any non-localhost deployment should opt in to TLS** — without it, the Postgres password and every block body travel the wire unencrypted.
+
+TLS support lives behind the `tls-native-tls` feature on `llm386-store-pg` (and forwards through `llm386-config`, the CLI, and the Python wrapper):
+
+```toml
+# Cargo dependency for library users
+llm386-store-pg = { version = "...", features = ["tls-native-tls"] }
+```
+
+```bash
+# CLI
+cargo install --path crates/llm386-cli --features tls-native-tls
+```
+
+```bash
+# Python
+maturin develop -F tls-native-tls   # (from python/)
+```
+
+Three modes:
+
+| `TlsMode`                  | `[store] tls = "..."` | Behavior |
+|----------------------------|-----------------------|----------|
+| `Disable`                  | `"disable"` (default) | Plaintext. Sets `sslmode=disable` on the connection so it can't accidentally upgrade. |
+| `Require`                  | `"require"`           | Mandate TLS. Verifies the server certificate against the system root CA store. Works out of the box against RDS, Cloud SQL, Supabase, Neon. |
+| `RequireCustomCa { ca_path }` | `"require-custom-ca"` (with `tls_ca_path = "..."`) | Mandate TLS. Verifies against a private CA bundle (PEM file). Use this when your Postgres is behind a private CA not in the system store. |
+
+`Require` and `RequireCustomCa` need the `tls-native-tls` feature. Without it, opening with either returns `StoreOpenError::TlsUnsupported` — **never** a silent fall-through to plaintext. And both modes force `sslmode=require` on the connection, so the postgres client genuinely refuses to fall back to plaintext if the server doesn't offer TLS (the default `sslmode=prefer` would silently downgrade).
+
+Library:
+
+```rust
+use llm386_store_pg::{PgStore, PgStoreConfig, TlsMode};
+
+let store = PgStore::open(
+    "postgres://user:pass@host/db",
+    &PgStoreConfig {
+        tls: TlsMode::Require,
+        ..Default::default()
+    },
+)?;
+```
+
+TOML config (consumed by CLI + Python via `--profiles`):
+
+```toml
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+tls     = "require"
+```
+
+Or with a private CA:
+
+```toml
+[store]
+backend     = "pg"
+url         = "postgres://user@host/db"
+tls         = "require-custom-ca"
+tls_ca_path = "/etc/ssl/private-pg-ca.pem"
+```
+
 ### Performance
 
 Perf hammer in `crates/llm386-store-bench/`: 10,000 blocks of 1 KiB each, single thread, local Unix socket to PostgreSQL 18 on the same host (macOS 25.4, APFS, M-series).

@@ -30,7 +30,7 @@ use llm386_pager::{
     Bm25Retriever, LexicalRetriever, RecencyRetriever, SectionBudgetTable, SessionRetriever,
 };
 use llm386_store_lmdb::{LmdbStore, StoreConfig};
-use llm386_store_pg::{PgStore, PgStoreConfig};
+use llm386_store_pg::{PgStore, PgStoreConfig, TlsMode};
 use llm386_tokenizer::{HfTokenizer, TokenizerRegistry};
 use serde::Deserialize;
 
@@ -73,7 +73,45 @@ pub enum StoreEntry {
         pool_size: Option<u32>,
         #[serde(default)]
         schema: Option<String>,
+        /// `"disable"` (default), `"require"`, or `"require-custom-ca"`.
+        /// The last requires `tls_ca_path` to be set. Modes other
+        /// than `disable` need the `tls-native-tls` cargo feature on
+        /// `llm386-store-pg` — opening with TLS in a build without
+        /// the feature returns `StoreOpenError::TlsUnsupported`,
+        /// never silently downgrades.
+        #[serde(default)]
+        tls: Option<String>,
+        /// PEM-encoded CA bundle, required when `tls =
+        /// "require-custom-ca"`.
+        #[serde(default)]
+        tls_ca_path: Option<PathBuf>,
     },
+}
+
+/// Translate the TOML `tls = "..."` string + optional `tls_ca_path`
+/// into a [`TlsMode`]. Unknown strings raise a clear error rather than
+/// silently defaulting to `Disable`.
+fn parse_tls_mode(
+    tls: Option<&str>,
+    tls_ca_path: Option<&std::path::Path>,
+) -> Result<TlsMode, String> {
+    match tls.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("disable") => Ok(TlsMode::Disable),
+        Some("require") => Ok(TlsMode::Require),
+        Some("require-custom-ca") => {
+            let ca_path = tls_ca_path.ok_or_else(|| {
+                "[store] tls = \"require-custom-ca\" requires `tls_ca_path` \
+                 to be set (PEM bundle)"
+                    .to_string()
+            })?;
+            Ok(TlsMode::RequireCustomCa {
+                ca_path: ca_path.to_path_buf(),
+            })
+        }
+        Some(other) => Err(format!(
+            "[store] tls = \"{other}\" — expected one of: disable, require, require-custom-ca",
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,7 +340,13 @@ pub fn open_backend(
     url: Option<String>,
 ) -> Result<StoreBackend, String> {
     match store_entry {
-        Some(StoreEntry::Pg { url: cfg_url, pool_size, schema }) => {
+        Some(StoreEntry::Pg {
+            url: cfg_url,
+            pool_size,
+            schema,
+            tls,
+            tls_ca_path,
+        }) => {
             if path.is_some() {
                 return Err(
                     "[store] backend=\"pg\" is incompatible with an LMDB path override; \
@@ -321,6 +365,7 @@ pub fn open_backend(
             if let Some(s) = schema {
                 cfg.schema = Some(s);
             }
+            cfg.tls = parse_tls_mode(tls.as_deref(), tls_ca_path.as_deref())?;
             let store = PgStore::open(&connect_url, &cfg)
                 .map_err(|e| format!("open pg store: {e}"))?;
             Ok(StoreBackend::Pg(Arc::new(store)))

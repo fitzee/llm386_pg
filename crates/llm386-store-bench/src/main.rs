@@ -84,6 +84,7 @@ fn main() {
                     &PgStoreConfig {
                         max_pool_size: 4,
                         schema: Some(schema.clone()),
+                        ..Default::default()
                     },
                 )
                 .expect("open pg");

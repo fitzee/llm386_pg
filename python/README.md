@@ -64,6 +64,28 @@ For the decision of *which* to pick — and what you give up either way — see 
 
 Once opened, every `Store` method (`put`, `page`, `pack`, `summarize`, edges, traces, custom retrievers) works identically against either backend.
 
+### TLS for Postgres
+
+The default Postgres connection is plaintext (`tls = "disable"`). **Any non-localhost deployment should opt in to TLS** — set it in the `[store]` section of your TOML config:
+
+```toml
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+tls     = "require"               # or "require-custom-ca"
+# tls_ca_path = "/etc/ssl/pg-ca.pem"   # required when tls = "require-custom-ca"
+```
+
+TLS support is feature-gated on the Rust side — build the extension with the feature on:
+
+```bash
+maturin develop --release -F tls-native-tls
+# or for a wheel:
+maturin build --release -F tls-native-tls
+```
+
+Without the feature, `tls = "require"` raises `LLM386Error: TLS mode … requires the tls-native-tls feature` at `Store(...)` time. There is **no silent fall-through to plaintext**. `tls = "require"` also forces `sslmode=require` on the underlying connection, so the postgres client refuses to fall back to plaintext if the server doesn't offer TLS. Full background in the [README → TLS section](../README.md#tls).
+
 ## Using as a memory layer in an agent loop
 
 ```python

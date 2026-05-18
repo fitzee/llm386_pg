@@ -17,6 +17,13 @@ description = "PyO3 bindings for the LLM386 context virtualization runtime."
 name = "llm386"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Enable TLS (`tls = "require"` etc. in the `[store]` TOML section)
+# for the Python wrapper. Forwards through llm386-config to
+# llm386-store-pg. Build with `maturin develop -F tls-native-tls`.
+tls-native-tls = ["llm386-config/tls-native-tls"]
+
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
 llm386-core = { path = "../crates/llm386-core" }

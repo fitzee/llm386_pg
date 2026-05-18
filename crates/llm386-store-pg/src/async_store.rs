@@ -13,7 +13,7 @@
 //! sites (axum handlers, tonic services, ingest pipelines) when you
 //! want real concurrency against Postgres.
 
-use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime, SslMode};
 use llm386_core::{
     BlockId, ContentHash, ContextBlock, Edge, SessionId, StoreError,
 };
@@ -26,6 +26,7 @@ use crate::common::{
     decode_block_id, edge_kind_from_str, edge_kind_to_str, id_bytes, is_valid_ident,
     provenance_to_json, row_to_block, session_bytes, token_counts_to_json, ts_to_i64,
 };
+use crate::tls::{TlsBackend, build_backend};
 
 /// Async PostgreSQL-backed block store.
 ///
@@ -51,7 +52,13 @@ impl std::fmt::Debug for AsyncPgStore {
 impl AsyncPgStore {
     /// Connect to `url`, build the deadpool pool, run migrations.
     /// Idempotent: subsequent opens reuse the existing tables.
-    #[instrument(skip(config), fields(schema = ?config.schema))]
+    ///
+    /// `config.tls` controls transport security. Default is
+    /// [`crate::TlsMode::Disable`] (plaintext) for back-compat;
+    /// production deployments should set [`crate::TlsMode::Require`]
+    /// or stronger. See [`crate::PgStore::open`] for the full
+    /// feature-gate behavior.
+    #[instrument(skip(config), fields(schema = ?config.schema, tls = ?config.tls))]
     pub async fn open(url: &str, config: &PgStoreConfig) -> Result<Self, StoreOpenError> {
         if let Some(schema) = &config.schema
             && !is_valid_ident(schema)
@@ -59,19 +66,47 @@ impl AsyncPgStore {
             return Err(StoreOpenError::InvalidSchemaName(schema.clone()));
         }
 
+        // Build the TLS connector once and reuse it for the pool
+        // (and any side connection the bootstrap path needs).
+        let tls = build_backend(&config.tls)?;
+
         let mut cfg = Config::new();
         cfg.url = Some(url.to_string());
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
+        // Force sslmode to match the TLS backend so `TlsMode::Require`
+        // genuinely requires TLS (the default `sslmode=prefer` would
+        // silently fall back to plaintext if the server doesn't offer
+        // TLS — a violation of the contract).
+        cfg.ssl_mode = Some(match &tls {
+            TlsBackend::Plain => SslMode::Disable,
+            #[cfg(feature = "tls-native-tls")]
+            TlsBackend::Native(_) => SslMode::Require,
+        });
 
-        let pool = cfg
-            .builder(NoTls)
-            .map_err(|e| StoreOpenError::Connect(format!("deadpool builder: {e}")))?
-            .max_size(config.max_pool_size as usize)
-            .runtime(Runtime::Tokio1)
-            .build()
-            .map_err(|e| StoreOpenError::Connect(format!("deadpool build: {e}")))?;
+        // `Pool` itself isn't generic over the TLS connector —
+        // deadpool-postgres erases it inside the Manager — so a single
+        // Pool type holds either branch.
+        let pool = match &tls {
+            TlsBackend::Plain => cfg
+                .builder(NoTls)
+                .map_err(|e| StoreOpenError::Connect(format!("deadpool builder: {e}")))?
+                .max_size(config.max_pool_size as usize)
+                .runtime(Runtime::Tokio1)
+                .build()
+                .map_err(|e| StoreOpenError::Connect(format!("deadpool build: {e}")))?,
+            #[cfg(feature = "tls-native-tls")]
+            TlsBackend::Native(connector) => {
+                let mts = postgres_native_tls::MakeTlsConnector::new(connector.clone());
+                cfg.builder(mts)
+                    .map_err(|e| StoreOpenError::Connect(format!("deadpool builder: {e}")))?
+                    .max_size(config.max_pool_size as usize)
+                    .runtime(Runtime::Tokio1)
+                    .build()
+                    .map_err(|e| StoreOpenError::Connect(format!("deadpool build: {e}")))?
+            }
+        };
 
         let store = Self {
             pool,

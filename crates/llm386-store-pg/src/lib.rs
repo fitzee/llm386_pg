@@ -27,8 +27,9 @@
 
 mod common;
 mod store;
+mod tls;
 
-pub use common::{PgStoreConfig, StoreOpenError};
+pub use common::{PgStoreConfig, StoreOpenError, TlsMode};
 pub use store::PgStore;
 
 #[cfg(feature = "async")]

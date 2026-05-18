@@ -51,6 +51,7 @@ fn open_test() -> Option<(Arc<PgStore>, String, String)> {
         &PgStoreConfig {
             max_pool_size: 8,
             schema: Some(schema.clone()),
+            ..Default::default()
         },
     )
     .expect("open PgStore");

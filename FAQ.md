@@ -21,6 +21,7 @@
   - [How does the context in LLM386 get exposed to the LLM model?](#how-does-the-context-in-llm386-get-exposed-to-the-llm-model)
 - [Performance and sizing](#performance-and-sizing)
   - [Should I use LMDB or Postgres for the block store? What am I giving up?](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up)
+  - [How do I enable TLS to my Postgres?](#how-do-i-enable-tls-to-my-postgres)
   - [How much latency does this add to my agent?](#how-much-latency-does-this-add-to-my-agent)
   - [How big can the memory store get?](#how-big-can-the-memory-store-get)
   - [Does the runtime pack only what's needed, or does it fill the model's context window?](#does-the-runtime-pack-only-whats-needed-or-does-it-fill-the-models-context-window)
@@ -237,6 +238,58 @@ url     = "postgres://user@host/db"
 CLI overrides: `llm386 --store ./path …` (LMDB) or `llm386 --pg-url postgres://… …` (PG). Python: `Store("./path")` or `Store(url="postgres://…")`.
 
 **Perf table:** the bundled [`llm386-store-bench`](./crates/llm386-store-bench/) hammers both backends with identical workloads. The full numbers — including the LMDB-write caveat and the PG-read socket-floor caveat — are in the [README → Performance section](./README.md#performance).
+
+### How do I enable TLS to my Postgres?
+
+The default is plaintext (`TlsMode::Disable`, `tls = "disable"`) — kept for back-compat. **Any non-localhost deployment should opt in to TLS** so the Postgres password and block bodies aren't exposed on the wire.
+
+Two pieces:
+
+1. **Build with the feature.** TLS support is gated on `tls-native-tls`. Enable it where you consume the store:
+
+   ```bash
+   # CLI:
+   cargo install --path crates/llm386-cli --features tls-native-tls
+
+   # Python wrapper:
+   maturin develop --release -F tls-native-tls   # (run from python/)
+
+   # Library:
+   # Cargo.toml
+   llm386-store-pg = { version = "...", features = ["tls-native-tls"] }
+   ```
+
+2. **Set the TLS mode.** In the `[store]` TOML section consumed by both CLI and Python:
+
+   ```toml
+   [store]
+   backend = "pg"
+   url     = "postgres://user@host/db"
+   tls     = "require"
+   ```
+
+   Or for a private CA bundle (when your Postgres is behind a CA not in the system trust store):
+
+   ```toml
+   [store]
+   backend     = "pg"
+   url         = "postgres://user@host/db"
+   tls         = "require-custom-ca"
+   tls_ca_path = "/etc/ssl/private-pg-ca.pem"
+   ```
+
+   Library users set [`TlsMode`](https://docs.rs/llm386-store-pg) directly on `PgStoreConfig`.
+
+**Two guard rails built in.** They both exist to fail loudly when TLS is misconfigured rather than silently downgrading:
+
+- `tls = "require"` without the `tls-native-tls` feature returns `StoreOpenError::TlsUnsupported` at open time. The build error is the right error — silently falling back to plaintext is exactly the failure mode this fix exists to prevent.
+- `tls = "require"` forces `sslmode=require` on the underlying connection. The default postgres `sslmode=prefer` would silently fall back to plaintext if the server doesn't offer TLS; our default for `Require` is the stricter mode that refuses to connect at all.
+
+**Common providers.** RDS, Cloud SQL, Supabase, and Neon all serve standard-CA-signed certs that `tls = "require"` validates out of the box — no `tls_ca_path` needed. Self-hosted Postgres with a custom CA needs `"require-custom-ca"` plus the PEM bundle.
+
+**Localhost.** Local development against a Postgres without SSL configured is fine with `tls = "disable"` (or by omitting the field). Don't ship that config to production.
+
+Full background in the [README → TLS section](./README.md#tls).
 
 ### How much latency does this add to my agent?
 

@@ -11,6 +11,15 @@ description = "Shared TOML config schema + backend-selection helpers for the LLM
 [lints]
 workspace = true
 
+[features]
+default = []
+# Forwards to `llm386-store-pg/tls-native-tls`. Enabling this on the
+# llm386-config crate lets the CLI / Python wrapper open Postgres
+# connections with TLS via the `[store] tls = "..."` TOML field
+# without the consumer needing to know about the underlying store
+# crate's feature flags.
+tls-native-tls = ["llm386-store-pg/tls-native-tls"]
+
 [dependencies]
 llm386-core = { workspace = true }
 llm386-pager = { workspace = true }
