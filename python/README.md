@@ -41,6 +41,29 @@ for msg in result.messages:
     print(f"[{msg.role}] {msg.content}")
 ```
 
+## Backend selection
+
+`Store` supports two persistent backends. Pick by argument or by config:
+
+```python
+from llm386 import Store
+
+# LMDB (positional path) — the default, embedded, single-process.
+store = Store("./store")
+
+# Postgres (url kwarg) — multi-process, multi-node, ACID across writers.
+store = Store(url="postgres://user@host/db")
+
+# Backend pinned in a TOML config — same schema the CLI reads.
+store = Store(profiles="./llm386.toml")
+```
+
+`profiles` can carry a `[store]` section that pins the backend without code changes; positional `path` and the `url` kwarg override the matching TOML field if both are given. Passing both `path` and `url` raises `LLM386Error`.
+
+For the decision of *which* to pick — and what you give up either way — see [FAQ → Should I use LMDB or Postgres?](../FAQ.md#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up). Short version: LMDB unless you need multi-process writes, no shared filesystem, or you already operate Postgres.
+
+Once opened, every `Store` method (`put`, `page`, `pack`, `summarize`, edges, traces, custom retrievers) works identically against either backend.
+
 ## Using as a memory layer in an agent loop
 
 ```python
@@ -110,6 +133,13 @@ store = Store("./store", profiles="./llm386.toml")
 ```toml
 # llm386.toml
 
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+schema  = "llm386"          # optional, defaults to public
+pool_size = 8               # optional, defaults to 8
+# Or:  backend = "lmdb", path = "./store"
+
 [[profile]]
 name = "my-tiny"
 max_context_tokens = 4096
@@ -129,7 +159,7 @@ kind = "recency"
 half_life_secs = 60.0
 ```
 
-`[[profile]]` adds model profiles on top of the built-ins. `[[hf_tokenizer]]` registers a HuggingFace tokenizer.json for non-OpenAI models. `[[retriever]]` replaces the default RecencyRetriever stack with whatever you configure.
+`[store]` pins the backend — overridden by the positional `path` or `url=` kwarg if both are given. `[[profile]]` adds model profiles on top of the built-ins. `[[hf_tokenizer]]` registers a HuggingFace tokenizer.json for non-OpenAI models. `[[retriever]]` replaces the default RecencyRetriever stack with whatever you configure.
 
 ## Summarization
 

@@ -18,6 +18,8 @@ workspace = true
 [dependencies]
 llm386-core = { workspace = true }
 llm386-store-lmdb = { workspace = true }
+llm386-store-pg = { workspace = true }
+llm386-config = { workspace = true }
 llm386-tokenizer = { workspace = true }
 llm386-pager = { workspace = true }
 llm386-packer = { workspace = true }

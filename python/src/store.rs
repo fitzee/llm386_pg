@@ -17,9 +17,9 @@ use llm386_core::{
     SessionId, Summarizer, Timestamp, TokenCount, TokenCounts, Tokenizer,
     TraceRecord as RustTraceRecord, TraceSink, default_registry,
 };
+use llm386_config::{StoreBackend, dispatch, open_backend};
 use llm386_packer::SimplePacker;
 use llm386_pager::GreedyPager;
-use llm386_store_lmdb::{LmdbStore, StoreConfig};
 use llm386_tokenizer::{TokenizerRegistry, default_registry as default_tokenizers};
 use llm386_trace::LmdbTraceSink;
 
@@ -34,7 +34,7 @@ create_exception!(llm386, LLM386Error, PyException);
 
 #[pyclass]
 pub struct Store {
-    inner: Arc<LmdbStore>,
+    inner: StoreBackend,
     tokenizers: TokenizerRegistry,
     models: ModelRegistry,
     retriever_entries: Vec<config::RetrieverEntry>,
@@ -45,36 +45,50 @@ pub struct Store {
 
 #[pymethods]
 impl Store {
-    /// Open (or create) an LMDB store at `path`. Idempotent.
+    /// Open a persistent block store. Idempotent.
+    ///
+    /// Backend selection:
+    ///   - A `[store]` section in the `profiles` TOML pins the
+    ///     backend kind. Within the chosen kind, explicit `url` /
+    ///     `path` kwargs take precedence over the TOML's value;
+    ///     missing fields fall back to the TOML.
+    ///   - With no `[store]` section, `url=` opens PostgreSQL and the
+    ///     positional `path` opens LMDB.
+    ///   - Passing both `path` and `url` (without a TOML pin), or
+    ///     mixing them across kinds (e.g. `url=` with
+    ///     `backend="lmdb"`), raises `LLM386Error`.
     ///
     /// `profiles` optionally points at a TOML config file with the
-    /// same schema the CLI accepts (`[[profile]]`,
-    /// `[[hf_tokenizer]]`, `[[retriever]]`). User profiles override
-    /// built-ins by name; user retriever entries replace the
-    /// default RecencyRetriever stack.
+    /// same schema the CLI accepts (`[[profile]]`, `[[hf_tokenizer]]`,
+    /// `[[retriever]]`, `[store]`). User profiles override built-ins
+    /// by name; user retriever entries replace the default
+    /// RecencyRetriever stack.
     #[new]
-    #[pyo3(signature = (path, *, profiles = None))]
-    fn new(path: PathBuf, profiles: Option<PathBuf>) -> PyResult<Self> {
-        let inner = Arc::new(
-            LmdbStore::open(&path, StoreConfig::default())
-                .map_err(|e| LLM386Error::new_err(format!("open store: {e}")))?,
-        );
+    #[pyo3(signature = (path = None, *, url = None, profiles = None))]
+    fn new(
+        path: Option<PathBuf>,
+        url: Option<String>,
+        profiles: Option<PathBuf>,
+    ) -> PyResult<Self> {
         let mut tokenizers = default_tokenizers()
             .map_err(|e| LLM386Error::new_err(format!("init tokenizers: {e}")))?;
         let mut models = default_registry();
-        let (retriever_entries, section_budgets, packer_options) = if let Some(cfg_path) = profiles
-        {
-            let parsed = config::parse(&cfg_path).map_err(LLM386Error::new_err)?;
-            let applied = config::apply(parsed, &mut models, &mut tokenizers)
-                .map_err(LLM386Error::new_err)?;
-            (
-                applied.retrievers,
-                applied.section_budgets,
-                applied.packer_options.unwrap_or_default(),
-            )
-        } else {
-            (Vec::new(), None, llm386_packer::PackerOptions::default())
-        };
+        let (retriever_entries, section_budgets, packer_options, store_entry) =
+            if let Some(cfg_path) = profiles {
+                let parsed = config::parse(&cfg_path).map_err(LLM386Error::new_err)?;
+                let applied = config::apply(parsed, &mut models, &mut tokenizers)
+                    .map_err(LLM386Error::new_err)?;
+                (
+                    applied.retrievers,
+                    applied.section_budgets,
+                    applied.packer_options.unwrap_or_default(),
+                    applied.store,
+                )
+            } else {
+                (Vec::new(), None, llm386_packer::PackerOptions::default(), None)
+            };
+
+        let inner = open_backend(store_entry, path, url).map_err(LLM386Error::new_err)?;
         Ok(Self {
             inner,
             tokenizers,
@@ -135,9 +149,7 @@ impl Store {
             provenance: Provenance::default(),
             hash: ContentHash::of(&bytes),
         };
-        let stored = self
-            .inner
-            .put(session, block)
+        let stored = dispatch!(&self.inner, |s| s.put(session, block))
             .map_err(|e| LLM386Error::new_err(format!("put: {e}")))?;
         Ok(format!("{stored}"))
     }
@@ -145,9 +157,7 @@ impl Store {
     /// Fetch a block by id (32-char hex string).
     fn show(&self, block_id: &str) -> PyResult<ContextBlock> {
         let id = parse_block_id(block_id)?;
-        let block = self
-            .inner
-            .get(id)
+        let block = dispatch!(&self.inner, |s| s.get(id))
             .map_err(|e| LLM386Error::new_err(format!("get: {e}")))?
             .ok_or_else(|| LLM386Error::new_err(format!("block not found: {block_id}")))?;
         Ok(ContextBlock::from_rust(block))
@@ -155,9 +165,7 @@ impl Store {
 
     /// Every distinct session id with at least one block.
     fn list_sessions(&self) -> PyResult<Vec<String>> {
-        let sessions = self
-            .inner
-            .list_sessions()
+        let sessions = dispatch!(&self.inner, |s| s.list_sessions())
             .map_err(|e| LLM386Error::new_err(format!("list_sessions: {e}")))?;
         Ok(sessions.into_iter().map(|s| format!("{s}")).collect())
     }
@@ -167,7 +175,8 @@ impl Store {
     /// Returns True if the block existed.
     fn delete(&self, block_id: &str) -> PyResult<bool> {
         let id = parse_block_id(block_id)?;
-        self.inner.delete(id).map_err(|e| LLM386Error::new_err(format!("delete: {e}")))
+        dispatch!(&self.inner, |s| s.delete(id))
+            .map_err(|e| LLM386Error::new_err(format!("delete: {e}")))
     }
 
     /// Remove every block belonging to `session`. Returns the count
@@ -175,8 +184,7 @@ impl Store {
     /// sessions are kept; ones with no remaining references are
     /// removed entirely (including from the content-hash index).
     fn purge_session(&self, session: u128) -> PyResult<usize> {
-        self.inner
-            .purge_session(SessionId(session))
+        dispatch!(&self.inner, |s| s.purge_session(SessionId(session)))
             .map_err(|e| LLM386Error::new_err(format!("purge_session: {e}")))
     }
 
@@ -190,8 +198,7 @@ impl Store {
             to: parse_block_id(to_id)?,
             kind: parse_edge_kind(kind)?,
         };
-        self.inner
-            .put_edge(edge)
+        dispatch!(&self.inner, |s| s.put_edge(edge))
             .map_err(|e| LLM386Error::new_err(format!("put_edge: {e}")))
     }
 
@@ -199,9 +206,7 @@ impl Store {
     /// kind)` tuples.
     fn edges_from(&self, block_id: &str) -> PyResult<Vec<(String, String)>> {
         let id = parse_block_id(block_id)?;
-        let edges = self
-            .inner
-            .edges_from(id)
+        let edges = dispatch!(&self.inner, |s| s.edges_from(id))
             .map_err(|e| LLM386Error::new_err(format!("edges_from: {e}")))?;
         Ok(edges
             .into_iter()
@@ -213,9 +218,7 @@ impl Store {
     /// kind)` tuples.
     fn edges_to(&self, block_id: &str) -> PyResult<Vec<(String, String)>> {
         let id = parse_block_id(block_id)?;
-        let edges = self
-            .inner
-            .edges_to(id)
+        let edges = dispatch!(&self.inner, |s| s.edges_to(id))
             .map_err(|e| LLM386Error::new_err(format!("edges_to: {e}")))?;
         Ok(edges
             .into_iter()
@@ -226,25 +229,7 @@ impl Store {
     /// Run the pager and return the resulting plan.
     fn page(&self, session: u128, model: &str, task: &str) -> PyResult<PagePlan> {
         let (profile, tokenizer) = self.profile_and_tokenizer(model)?;
-        let mut pager = GreedyPager::new(self.inner.clone(), tokenizer);
-        let mut retrievers = config::build_retrievers(&self.retriever_entries, &self.inner)
-            .map_err(LLM386Error::new_err)?
-            .unwrap_or_default();
-        retrievers.extend(self.python_retrievers.read().iter().cloned());
-        if !retrievers.is_empty() {
-            pager = pager.with_retrievers(retrievers);
-        }
-        if let Some(budgets) = &self.section_budgets {
-            pager = pager.with_budgets(budgets.clone());
-        }
-        let request = PageRequest {
-            session_id: SessionId(session),
-            task: task.to_string(),
-            model: profile,
-            required_blocks: vec![],
-        };
-        let plan = pager.page(request).map_err(|e| LLM386Error::new_err(format!("page: {e}")))?;
-        Ok(PagePlan::from_rust(plan))
+        dispatch!(&self.inner, |s| self.page_with(s.clone(), profile, tokenizer, session, task))
     }
 
     /// Run page+pack and return either a rendered prompt or a list
@@ -265,31 +250,16 @@ impl Store {
         trace: Option<PathBuf>,
     ) -> PyResult<PackResult> {
         let (profile, tokenizer) = self.profile_and_tokenizer(model)?;
-        let mut pager = GreedyPager::new(self.inner.clone(), tokenizer.clone());
-        let mut retrievers = config::build_retrievers(&self.retriever_entries, &self.inner)
-            .map_err(LLM386Error::new_err)?
-            .unwrap_or_default();
-        retrievers.extend(self.python_retrievers.read().iter().cloned());
-        if !retrievers.is_empty() {
-            pager = pager.with_retrievers(retrievers);
-        }
-        if let Some(budgets) = &self.section_budgets {
-            pager = pager.with_budgets(budgets.clone());
-        }
-        let request = PageRequest {
-            session_id: SessionId(session),
-            task: task.to_string(),
-            model: profile,
-            required_blocks: vec![],
-        };
-
-        let started_at = Timestamp(now_ms());
-        let started = Instant::now();
-        let plan = pager
-            .page(request.clone())
-            .map_err(|e| LLM386Error::new_err(format!("page: {e}")))?;
-
-        self.render(request, plan, tokenizer, chat, timestamps, trace, started_at, started)
+        dispatch!(&self.inner, |s| self.pack_with(
+            s.clone(),
+            profile,
+            tokenizer,
+            session,
+            task,
+            chat,
+            timestamps,
+            trace,
+        ))
     }
 
     /// Re-render an existing [`PagePlan`] for a (possibly different)
@@ -349,7 +319,17 @@ impl Store {
 
         let started_at = Timestamp(now_ms());
         let started = Instant::now();
-        self.render(request, rust_plan, tokenizer, chat, timestamps, trace, started_at, started)
+        dispatch!(&self.inner, |s| self.render(
+            s.clone(),
+            request.clone(),
+            rust_plan.clone(),
+            tokenizer.clone(),
+            chat,
+            timestamps,
+            trace.clone(),
+            started_at,
+            started,
+        ))
     }
 
     /// Summarize a session via the named summarizer.
@@ -375,9 +355,7 @@ impl Store {
         anthropic_max_tokens: Option<u32>,
     ) -> PyResult<String> {
         let session = SessionId(session);
-        let mut ids = self
-            .inner
-            .list_session(session)
+        let mut ids = dispatch!(&self.inner, |s| s.list_session(session))
             .map_err(|e| LLM386Error::new_err(format!("list_session: {e}")))?;
         ids.sort();
         if let Some(n) = last {
@@ -386,8 +364,8 @@ impl Store {
         }
         let mut blocks: Vec<RustBlock> = Vec::with_capacity(ids.len());
         for &id in &ids {
-            if let Some(b) =
-                self.inner.get(id).map_err(|e| LLM386Error::new_err(format!("get: {e}")))?
+            if let Some(b) = dispatch!(&self.inner, |s| s.get(id))
+                .map_err(|e| LLM386Error::new_err(format!("get: {e}")))?
             {
                 blocks.push(b);
             }
@@ -451,8 +429,7 @@ impl Store {
                 },
                 hash: ContentHash::of(&bytes),
             };
-            self.inner
-                .put(session, block)
+            dispatch!(&self.inner, |s| s.put(session, block))
                 .map_err(|e| LLM386Error::new_err(format!("store summary: {e}")))?;
         }
         Ok(text)
@@ -478,12 +455,93 @@ impl Store {
         Ok((profile, tokenizer))
     }
 
-    /// Shared rendering core for `pack` and `pack_with_plan`. Builds
-    /// a `SimplePacker`, dispatches `pack` or `pack_chat`, optionally
-    /// records a trace, and packages the result for Python.
-    #[allow(clippy::too_many_arguments)] // factored from the two callers; bundling obscures the API
-    fn render(
+    /// Build a configured `GreedyPager<S>` for a concrete backend.
+    fn make_pager<S>(
         &self,
+        store: Arc<S>,
+        tokenizer: Arc<dyn Tokenizer>,
+    ) -> PyResult<GreedyPager<S>>
+    where
+        S: BlockStore + 'static,
+    {
+        let mut pager = GreedyPager::new(store.clone(), tokenizer);
+        let mut retrievers = config::build_retrievers(&self.retriever_entries, &store)
+            .map_err(LLM386Error::new_err)?
+            .unwrap_or_default();
+        retrievers.extend(self.python_retrievers.read().iter().cloned());
+        if !retrievers.is_empty() {
+            pager = pager.with_retrievers(retrievers);
+        }
+        if let Some(budgets) = &self.section_budgets {
+            pager = pager.with_budgets(budgets.clone());
+        }
+        Ok(pager)
+    }
+
+    /// Backend-specific `page()` core. Built and dispatched once per
+    /// `StoreBackend` arm by [`Store::page`].
+    fn page_with<S>(
+        &self,
+        store: Arc<S>,
+        profile: llm386_core::ModelProfile,
+        tokenizer: Arc<dyn Tokenizer>,
+        session: u128,
+        task: &str,
+    ) -> PyResult<PagePlan>
+    where
+        S: BlockStore + 'static,
+    {
+        let pager = self.make_pager(store, tokenizer)?;
+        let request = PageRequest {
+            session_id: SessionId(session),
+            task: task.to_string(),
+            model: profile,
+            required_blocks: vec![],
+        };
+        let plan = pager.page(request).map_err(|e| LLM386Error::new_err(format!("page: {e}")))?;
+        Ok(PagePlan::from_rust(plan))
+    }
+
+    /// Backend-specific `pack()` core: pages, then hands off to
+    /// [`Store::render`].
+    #[allow(clippy::too_many_arguments)] // matches the pyfn surface
+    fn pack_with<S>(
+        &self,
+        store: Arc<S>,
+        profile: llm386_core::ModelProfile,
+        tokenizer: Arc<dyn Tokenizer>,
+        session: u128,
+        task: &str,
+        chat: bool,
+        timestamps: bool,
+        trace: Option<PathBuf>,
+    ) -> PyResult<PackResult>
+    where
+        S: BlockStore + 'static,
+    {
+        let pager = self.make_pager(store.clone(), tokenizer.clone())?;
+        let request = PageRequest {
+            session_id: SessionId(session),
+            task: task.to_string(),
+            model: profile,
+            required_blocks: vec![],
+        };
+        let started_at = Timestamp(now_ms());
+        let started = Instant::now();
+        let plan = pager
+            .page(request.clone())
+            .map_err(|e| LLM386Error::new_err(format!("page: {e}")))?;
+        self.render(store, request, plan, tokenizer, chat, timestamps, trace, started_at, started)
+    }
+
+    /// Shared rendering core for `pack` and `pack_with_plan`. Builds
+    /// a `SimplePacker<S>` for the concrete backend, dispatches
+    /// `pack` or `pack_chat`, optionally records a trace, and
+    /// packages the result for Python.
+    #[allow(clippy::too_many_arguments)] // factored from the callers; bundling obscures the API
+    fn render<S>(
+        &self,
+        store: Arc<S>,
         request: PageRequest,
         plan: RustPagePlan,
         tokenizer: Arc<dyn Tokenizer>,
@@ -492,13 +550,15 @@ impl Store {
         trace: Option<PathBuf>,
         started_at: Timestamp,
         started: Instant,
-    ) -> PyResult<PackResult> {
+    ) -> PyResult<PackResult>
+    where
+        S: BlockStore + 'static,
+    {
         let mut packer_options = self.packer_options.clone();
         if timestamps {
             packer_options.include_timestamps = true;
         }
-        let packer =
-            SimplePacker::new(self.inner.clone(), tokenizer).with_options(packer_options);
+        let packer = SimplePacker::new(store, tokenizer).with_options(packer_options);
 
         if chat {
             let chat_prompt = packer

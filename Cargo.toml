@@ -14,6 +14,7 @@ members = [
     "crates/llm386-diff",
     "crates/llm386-reduce",
     "crates/llm386-retrieve-ann",
+    "crates/llm386-config",
     "crates/llm386-cli",
 ]
 
@@ -55,6 +56,7 @@ llm386-compress-anthropic = { path = "crates/llm386-compress-anthropic", version
 llm386-diff = { path = "crates/llm386-diff", version = "1.0.0-alpha" }
 llm386-reduce = { path = "crates/llm386-reduce", version = "1.0.0-alpha" }
 llm386-retrieve-ann = { path = "crates/llm386-retrieve-ann", version = "1.0.0-alpha" }
+llm386-config = { path = "crates/llm386-config", version = "1.0.0-alpha" }
 
 # Common runtime deps (added per-crate as needed)
 thiserror = "2"

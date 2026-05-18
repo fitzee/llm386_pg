@@ -557,6 +557,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadpool"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be2b1d1d6ec8d846f05e137292d0b89133caf95ef33695424c09568bdd39b1b"
+dependencies = [
+ "deadpool-runtime",
+ "lazy_static",
+ "num_cpus",
+ "tokio",
+]
+
+[[package]]
+name = "deadpool-postgres"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d697d376cbfa018c23eb4caab1fd1883dd9c906a8c034e8d9a3cb06a7e0bef9"
+dependencies = [
+ "async-trait",
+ "deadpool",
+ "getrandom 0.2.17",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+]
+
+[[package]]
+name = "deadpool-runtime"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1282,11 +1317,13 @@ dependencies = [
  "getrandom 0.4.2",
  "llm386-compress",
  "llm386-compress-anthropic",
+ "llm386-config",
  "llm386-core",
  "llm386-diff",
  "llm386-packer",
  "llm386-pager",
  "llm386-store-lmdb",
+ "llm386-store-pg",
  "llm386-tokenizer",
  "llm386-trace",
  "serde",
@@ -1312,6 +1349,20 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "llm386-config"
+version = "1.0.0-alpha"
+dependencies = [
+ "llm386-core",
+ "llm386-packer",
+ "llm386-pager",
+ "llm386-store-lmdb",
+ "llm386-store-pg",
+ "llm386-tokenizer",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -1414,6 +1465,7 @@ dependencies = [
 name = "llm386-store-pg"
 version = "1.0.0-alpha"
 dependencies = [
+ "deadpool-postgres",
  "llm386-core",
  "postgres",
  "proptest",
@@ -1422,6 +1474,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-postgres",
  "tracing",
 ]
 
@@ -2721,7 +2775,19 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

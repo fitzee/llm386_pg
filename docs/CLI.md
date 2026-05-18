@@ -7,8 +7,9 @@ If you only want to skim, the [Quick start](../README.md#quick-start) in the pro
 ## Conventions
 
 - Block, session, call, and content-hash ids are 128-bit. They accept three forms: decimal (`42`), `0x`-prefixed hex (`0x7b73...`), or bare 32-char hex (the form printed by `llm386 show`, `page`, and `pack`).
-- `--store <path>` always points at an LMDB directory. The directory is created on first use; reopening is cheap.
-- `--profiles <path>` is a global flag that loads extra `[[profile]]`, `[[hf_tokenizer]]`, and `[[retriever]]` entries from a TOML file. Set once and use with any subcommand. Equivalent env var: `LLM386_PROFILES`.
+- The block-store backend is selected by global flags (`--store` for LMDB, `--pg-url` for Postgres) or pinned in the `[store]` section of the `--profiles` TOML. The flag wins over the matching field in TOML; mixing kinds (e.g. `--pg-url` when TOML says `backend = "lmdb"`) errors. See [Backend selection](#backend-selection) below.
+- `--profiles <path>` is a global flag that loads extra `[[profile]]`, `[[hf_tokenizer]]`, `[[retriever]]`, `[store]`, `[section_budgets]`, `[packer]`, and `[cache]` entries from a TOML file. Set once and use with any subcommand. Equivalent env var: `LLM386_PROFILES`.
+- The trace store is a *separate* LMDB sink and uses its own `--trace-store <path>` flag on the trace subcommands. It is independent of the block-store backend choice.
 - Long-running output (rendered prompts, JSON dumps) goes to stdout; status, manifest headers, and trace ids go to stderr. Redirect them separately.
 - Logging is controlled by `RUST_LOG` (default `warn`). `RUST_LOG=info,llm386=debug llm386 pack ...` is useful when something looks wrong.
 
@@ -16,9 +17,41 @@ If you only want to skim, the [Quick start](../README.md#quick-start) in the pro
 
 | Flag | Description |
 | --- | --- |
-| `--profiles <path>` | TOML config with extra model profiles, HF tokenizers, and a custom retriever stack. See [README → Custom config](../README.md#custom-config) for the schema. |
+| `--store <path>` | LMDB block-store directory. Created on first use. Overrides `path` in the TOML `[store]` section. Mutually exclusive with `--pg-url`. |
+| `--pg-url <url>` | PostgreSQL connection URL for the block store. Schema bootstraps on first connect. Overrides `url` in the TOML `[store]` section. Mutually exclusive with `--store`. |
+| `--profiles <path>` | TOML config with extra model profiles, HF tokenizers, a backend pin, a custom retriever stack, and packer/cache knobs. See [README → Custom config](../README.md#custom-config) for the full schema. |
 | `--help`, `-h` | Help on any command. `llm386 trace diff --help` works too. |
 | `--version` | Print the binary version. |
+
+## Backend selection
+
+The same `llm386` binary drives either LMDB or PostgreSQL. Resolution order, highest priority first:
+
+1. **TOML `[store]` section** picks the backend *kind*. Within the chosen kind, an explicit field (e.g. `url`) is used unless overridden by the matching flag.
+2. **CLI flag**: `--store` (LMDB) or `--pg-url` (PG). Wins over the matching field in TOML; with no `[store]` section, fully selects the backend.
+
+Examples:
+
+```bash
+# LMDB, no config file:
+llm386 --store ./store page --session 1 --model gpt-4o --task "..."
+
+# Postgres, no config file:
+llm386 --pg-url postgres://user@host/db page --session 1 --model gpt-4o --task "..."
+
+# Backend pinned in TOML; no flag needed:
+cat > llm386.toml <<EOF
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+schema  = "llm386"
+EOF
+llm386 --profiles ./llm386.toml page --session 1 --model gpt-4o --task "..."
+```
+
+Subcommands that depend on backend-specific surface area (currently `verify` and `repair`, which walk LMDB internals) error cleanly when run against PG (`verify is LMDB-only (active backend: pg)`). Postgres has native equivalents — `pg_dump`, foreign-key checks, `REINDEX`, `VACUUM` — that are run outside this tool.
+
+For the decision of *which* backend to pick, see [FAQ → Should I use LMDB or Postgres?](../FAQ.md#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up).
 
 ---
 
@@ -30,9 +63,9 @@ If you only want to skim, the [Quick start](../README.md#quick-start) in the pro
 llm386 init <path>
 ```
 
-Create (or open) an LMDB store directory.
+Create (or open) an LMDB store directory. **LMDB-only**; the Postgres backend bootstraps its schema automatically on first connect, so there is no separate init step. `init` ignores the global `--store` / `--pg-url` flags.
 
-**Use when:** bootstrapping a new project. After this every other command points `--store` at the same path. Idempotent — running `init` against an existing store just confirms the schema version.
+**Use when:** bootstrapping a new LMDB project. After this every other command points `--store` at the same path (or pins it in TOML). Idempotent — running `init` against an existing store just confirms the schema version.
 
 **Example:**
 
@@ -45,10 +78,10 @@ llm386 init ./store
 ### `put`
 
 ```
-llm386 put --store <store> --session <id> --kind <kind> [--priority <0..1>] <file|->
+llm386 [--store <path> | --pg-url <url>] put --session <id> --kind <kind> [--priority <0..1>] <file|->
 ```
 
-Insert a block from a file or stdin. Blocks are content-hash deduped: putting the same bytes twice returns the same `BlockId` and adds the new session as another reference.
+Insert a block from a file or stdin. Blocks are content-hash deduped: putting the same bytes twice returns the same `BlockId` and adds the new session as another reference. Works identically against either backend.
 
 **Kinds:**
 
@@ -63,13 +96,17 @@ Insert a block from a file or stdin. Blocks are content-hash deduped: putting th
 ```bash
 # System prompt and a long-lived fact, both pinned to session 1.
 echo "You are a concise assistant." \
-  | llm386 put --store ./store --session 1 --kind system -
+  | llm386 --store ./store put --session 1 --kind system -
 
 echo "User's tier is 'enterprise'." \
-  | llm386 put --store ./store --session 1 --kind fact --priority 0.8 -
+  | llm386 --store ./store put --session 1 --kind fact --priority 0.8 -
+
+# Same call against a Postgres backend:
+echo "User's tier is 'enterprise'." \
+  | llm386 --pg-url postgres://user@host/db put --session 1 --kind fact --priority 0.8 -
 
 # Ingest a markdown file as a document chunk (RAG-style).
-llm386 put --store ./store --session 1 --kind document-chunk ./onboarding.md
+llm386 --store ./store put --session 1 --kind document-chunk ./onboarding.md
 ```
 
 ---
@@ -77,7 +114,7 @@ llm386 put --store ./store --session 1 --kind document-chunk ./onboarding.md
 ### `list-sessions`
 
 ```
-llm386 list-sessions --store <store>
+llm386 [--store <path> | --pg-url <url>] list-sessions
 ```
 
 Print every distinct session id that owns at least one block.
@@ -89,7 +126,7 @@ Print every distinct session id that owns at least one block.
 ### `show`
 
 ```
-llm386 show --store <store> [--json] <block-id>
+llm386 [--store <path> | --pg-url <url>] show [--json] <block-id>
 ```
 
 Print a single block: kind, hash, timestamps, priority, provenance, and the body. With `--json` you get a serialized `ContextBlock` suitable for piping into `jq`.
@@ -101,10 +138,12 @@ Print a single block: kind, hash, timestamps, priority, provenance, and the body
 ### `verify`
 
 ```
-llm386 verify --store <store>
+llm386 --store <store> verify
 ```
 
 Read-only integrity check. Walks every block, recomputes its content hash, and verifies the `blocks_by_hash` and `blocks_by_session` indexes are consistent. Reports orphans and mismatches without touching anything.
+
+**LMDB-only.** Postgres has native integrity primitives (foreign-key checks, `REINDEX`, `pg_dump --serializable-deferrable`) so this tool isn't ported. Running it with `--pg-url` errors with `verify is LMDB-only (active backend: pg)`.
 
 **Use when:** after an ungraceful shutdown, before a backup, or when something feels off. It is safe to run on a busy store but it does walk every block.
 
@@ -113,10 +152,12 @@ Read-only integrity check. Walks every block, recomputes its content hash, and v
 ### `repair`
 
 ```
-llm386 repair --store <store> --yes
+llm386 --store <store> repair --yes
 ```
 
 Rebuild derivable indexes (the hash index) from the primary block table and remove orphan session entries that point at missing blocks. **Destructive:** requires `--yes`. Hash *mismatches* (where the stored hash doesn't match the recomputed bytes) are quarantined and reported, not silently overwritten — a mismatch implies real corruption that warrants human review.
+
+**LMDB-only**, same reasoning as `verify`. Errors cleanly under `--pg-url`.
 
 **Use when:** `verify` reports problems that aren't quarantined hash mismatches. For mismatches, restore from backup.
 
@@ -125,8 +166,8 @@ Rebuild derivable indexes (the hash index) from the primary block table and remo
 ### `purge`
 
 ```
-llm386 purge --store <store> --block <id>   --yes
-llm386 purge --store <store> --session <id> --yes
+llm386 [--store <path> | --pg-url <url>] purge --block <id>   --yes
+llm386 [--store <path> | --pg-url <url>] purge --session <id> --yes
 ```
 
 Delete a single block or every block in a session. `--block` and `--session` are mutually exclusive. Blocks still referenced by another session are kept (since the store is a multi-tenant blob keyed by content hash); blocks with no remaining references are removed entirely, including from the hash index and any edges that touched them. **Destructive:** requires `--yes`.
@@ -154,7 +195,7 @@ List every built-in `ModelProfile`, plus any `[[profile]]` entries you added via
 ### `page`
 
 ```
-llm386 page --store <store> --session <id> --model <name> --task <text> [--json]
+llm386 [--store <path> | --pg-url <url>] page --session <id> --model <name> --task <text> [--json]
 ```
 
 Run only the pager. Print the resulting `PagePlan`: which blocks were selected (with their selection reason), which were omitted (with why), and the estimated input-token total. Does not render a prompt.
@@ -165,10 +206,10 @@ Run only the pager. Print the resulting `PagePlan`: which blocks were selected (
 
 ```bash
 # Human-readable plan.
-llm386 page --store ./store --session 1 --model gpt-4o --task "explain Australia's history"
+llm386 --store ./store page --session 1 --model gpt-4o --task "explain Australia's history"
 
 # Machine-readable for piping into jq, scripts, or a test harness.
-llm386 page --store ./store --session 1 --model gpt-4o --task "..." --json \
+llm386 --store ./store page --session 1 --model gpt-4o --task "..." --json \
   | jq '.selections | group_by(.reason) | map({reason: .[0].reason, count: length})'
 ```
 
@@ -177,15 +218,15 @@ llm386 page --store ./store --session 1 --model gpt-4o --task "..." --json \
 ### `pack`
 
 ```
-llm386 pack --store <store> --session <id> --model <name> --task <text>
-            [--prompt-only] [--chat] [--trace <path>]
+llm386 [--store <path> | --pg-url <url>] pack --session <id> --model <name> --task <text>
+       [--prompt-only] [--chat] [--trace <path>]
 ```
 
 Run page + pack. By default prints a manifest header on stderr (model, input tokens, duration) and the rendered prompt on stdout.
 
-- `--prompt-only` suppresses the manifest. Use this when piping into another tool: `llm386 pack ... --prompt-only > prompt.txt`.
+- `--prompt-only` suppresses the manifest. Use this when piping into another tool: `llm386 ... pack --prompt-only > prompt.txt`.
 - `--chat` renders as a JSON list of role-tagged messages instead of a single string. Suitable for chat-completion APIs (`{"role": "system", "content": "..."}`, etc.). Mutually exclusive with `--prompt-only`.
-- `--trace <path>` records the call to an LMDB trace store. The `CallId` is printed on stderr. Replay-complete traces also need `update_output` from your agent loop after the model returns; see the [README → Using as a memory layer](../README.md#using-as-a-memory-layer) for the full turn shape.
+- `--trace <path>` records the call to an LMDB trace store. The `CallId` is printed on stderr. The trace store is always LMDB regardless of which block-store backend you're using — it's a separate sink. Replay-complete traces also need `update_output` from your agent loop after the model returns; see the [README → Using as a memory layer](../README.md#using-as-a-memory-layer) for the full turn shape.
 
 **Use when:** the actual hot-path command for an agent that calls `llm386` from a shell or a non-Rust process. For programmatic use prefer the library API or the Python SDK so you can patch the trace's `output` field back in.
 
@@ -193,14 +234,14 @@ Run page + pack. By default prints a manifest header on stderr (model, input tok
 
 ```bash
 # Render to a chat-API-shaped JSON list and pipe it.
-llm386 pack --store ./store --session 1 --model gpt-4o --task "answer the user" --chat \
+llm386 --store ./store pack --session 1 --model gpt-4o --task "answer the user" --chat \
   | curl -s https://api.openai.com/v1/chat/completions \
       -H "Authorization: Bearer $OPENAI_API_KEY" \
       -H "Content-Type: application/json" \
       -d "$(jq '{model:"gpt-4o", messages: .}')"
 
 # Record a trace for later inspection.
-llm386 pack --store ./store --session 1 --model gpt-4o --task "..." \
+llm386 --store ./store pack --session 1 --model gpt-4o --task "..." \
   --trace ./traces > /dev/null
 # call_id prints on stderr; copy it for `trace show` / `trace diff`.
 ```
@@ -214,7 +255,7 @@ Typed directed edges add structure beyond `Provenance.parents`. The pager follow
 ### `add-edge`
 
 ```
-llm386 add-edge --store <store> --from <id> --to <id> --kind <kind>
+llm386 [--store <path> | --pg-url <url>] add-edge --from <id> --to <id> --kind <kind>
 ```
 
 Persist a directed edge. Idempotent: re-adding the same `(from, to, kind)` triple is a no-op. Deleting either endpoint via `purge` scrubs the edge automatically.
@@ -229,8 +270,8 @@ Persist a directed edge. Idempotent: re-adding the same `(from, to, kind)` tripl
 **Examples:**
 
 ```bash
-llm386 add-edge --store ./store --from 9c1d... --to 4f2a... --kind supports
-llm386 add-edge --store ./store --from <assistant-msg> --to <tool-result> --kind tool-invocation
+llm386 --store ./store add-edge --from 9c1d... --to 4f2a... --kind supports
+llm386 --store ./store add-edge --from <assistant-msg> --to <tool-result> --kind tool-invocation
 ```
 
 ---
@@ -238,7 +279,7 @@ llm386 add-edge --store ./store --from <assistant-msg> --to <tool-result> --kind
 ### `edges`
 
 ```
-llm386 edges --store <store> [--incoming] <block-id>
+llm386 [--store <path> | --pg-url <url>] edges [--incoming] <block-id>
 ```
 
 List edges incident to a block. Outgoing by default; `--incoming` flips the direction. Output format: `<from> --<Kind>--> <to>`.
@@ -249,24 +290,24 @@ List edges incident to a block. Outgoing by default; `--incoming` flips the dire
 
 ## Traces
 
-Every `pack --trace ./traces` invocation writes a `TraceRecord`. Traces are an LMDB store of their own (separate from the block store). They give you full replay context for any past call.
+Every `pack --trace ./traces` invocation writes a `TraceRecord`. Traces are an LMDB store of their own (always LMDB, regardless of which block-store backend you use). They give you full replay context for any past call.
 
 ### `trace show`
 
 ```
-llm386 trace show --store <trace-store> <call-id>
+llm386 trace show --trace-store <path> <call-id>
 ```
 
 Print a single trace record: model, model version, tokenizer version, prompt hash, started-at, duration, input tokens, output (if patched in), and the full page plan.
 
-**Use when:** "why did the model see X on call Y?" Answers it with byte-level precision. Pair with `llm386 show <block-id>` to inspect each selected block.
+**Use when:** "why did the model see X on call Y?" Answers it with byte-level precision. Pair with `llm386 [--store ... | --pg-url ...] show <block-id>` to inspect each selected block.
 
 ---
 
 ### `trace diff`
 
 ```
-llm386 trace diff --store <trace-store> <prev-call-id> <next-call-id>
+llm386 trace diff --trace-store <path> <prev-call-id> <next-call-id>
 ```
 
 Compute a structured diff between two trace records' page plans. Output looks like:
@@ -293,11 +334,11 @@ reason changes (1):
 ### `summarize`
 
 ```
-llm386 summarize --store <store> --session <id>
-                 [--summarizer noop|truncating|anthropic]
-                 [--max-chars <n>] [--last <n>]
-                 [--store-summary]
-                 [--anthropic-model <name>] [--anthropic-max-tokens <n>]
+llm386 [--store <path> | --pg-url <url>] summarize --session <id>
+                                                    [--summarizer noop|truncating|anthropic]
+                                                    [--max-chars <n>] [--last <n>]
+                                                    [--store-summary]
+                                                    [--anthropic-model <name>] [--anthropic-max-tokens <n>]
 ```
 
 Summarize a session's blocks via the chosen summarizer. Default `truncating` (first N chars per block, no API calls). `anthropic` requires `ANTHROPIC_API_KEY` and uses Claude.
@@ -318,10 +359,10 @@ Summarize a session's blocks via the chosen summarizer. Default `truncating` (fi
 
 ```bash
 # Pure local summary, no API calls.
-llm386 summarize --store ./store --session 1
+llm386 --store ./store summarize --session 1
 
 # Persist a model-driven rollup for paging fallback.
-ANTHROPIC_API_KEY=... llm386 summarize --store ./store --session 1 \
+ANTHROPIC_API_KEY=... llm386 --store ./store summarize --session 1 \
   --summarizer anthropic --store-summary
 ```
 
@@ -331,50 +372,68 @@ ANTHROPIC_API_KEY=... llm386 summarize --store ./store --session 1 \
 
 A few common things you'll do that span multiple commands:
 
+**Set the backend once via env var.** With `LLM386_PROFILES` pointing at a TOML that pins `[store]`, you can drop the `--store` / `--pg-url` flag from every invocation:
+
+```bash
+cat > llm386.toml <<EOF
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+schema  = "llm386"
+EOF
+export LLM386_PROFILES=$PWD/llm386.toml
+
+# Now every command uses the configured backend automatically:
+llm386 page --session 1 --model gpt-4o --task "..."
+llm386 pack --session 1 --model gpt-4o --task "..." --chat
+```
+
+The CLI flags still win if you want to point at a different store for a single command.
+
 **Bootstrap and ingest.**
 
 ```bash
 llm386 init ./store
-echo "You are a careful expert." | llm386 put --store ./store --session 1 --kind system -
+echo "You are a careful expert." | llm386 --store ./store put --session 1 --kind system -
 for f in docs/*.md; do
-  llm386 put --store ./store --session 1 --kind document-chunk "$f"
+  llm386 --store ./store put --session 1 --kind document-chunk "$f"
 done
 llm386 list-models
-llm386 page --store ./store --session 1 --model gpt-4o --task "summarize the docs"
+llm386 --store ./store page --session 1 --model gpt-4o --task "summarize the docs"
 ```
 
 **Audit a model call after the fact.**
 
 ```bash
 # 1. Was the call recorded?
-llm386 trace show --store ./traces 019abc...
+llm386 trace show --trace-store ./traces 019abc...
 
 # 2. What blocks did it see?
-llm386 show --store ./store <block-id-from-the-plan> --json | jq
+llm386 --store ./store show <block-id-from-the-plan> --json | jq
 
 # 3. How is this turn different from the previous one?
-llm386 trace diff --store ./traces <prev-call-id> 019abc...
+llm386 trace diff --trace-store ./traces <prev-call-id> 019abc...
 ```
 
 **Scrub customer data.**
 
 ```bash
 # Find candidate blocks (script over `list-sessions` + `show`).
-llm386 list-sessions --store ./store
+llm386 --store ./store list-sessions
 # Once identified:
-llm386 purge --store ./store --block <bad-id> --yes
+llm386 --store ./store purge --block <bad-id> --yes
 # Or wholesale per session:
-llm386 purge --store ./store --session 42 --yes
-# Then verify the indexes are still consistent.
-llm386 verify --store ./store
+llm386 --store ./store purge --session 42 --yes
+# Then verify the indexes are still consistent (LMDB-only).
+llm386 --store ./store verify
 ```
 
 **Wire up edge-aware paging for tool results.** When you `put` a tool result, also tie it to the assistant message that called it:
 
 ```bash
-asst_id=$(echo "..." | llm386 put --store ./store --session 1 --kind assistant-message -)
-tool_id=$(cat tool_output.json | llm386 put --store ./store --session 1 --kind tool-result -)
-llm386 add-edge --store ./store --from "$asst_id" --to "$tool_id" --kind tool-invocation
+asst_id=$(echo "..." | llm386 --store ./store put --session 1 --kind assistant-message -)
+tool_id=$(cat tool_output.json | llm386 --store ./store put --session 1 --kind tool-result -)
+llm386 --store ./store add-edge --from "$asst_id" --to "$tool_id" --kind tool-invocation
 ```
 
 The pager's `include_parents` policy (on by default in many configs) will then pull the assistant message back in whenever the tool result is selected, even on later turns.

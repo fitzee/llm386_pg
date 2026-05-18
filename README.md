@@ -118,7 +118,59 @@ A few design notes:
 - **LMDB**: embedded library, single process, read-heavy, low-latency. The default for the bundled CLI and Python SDK.
 - **Postgres**: multi-process or multi-node deployments, shared operational infrastructure, ACID across writers, future ANN co-location with `pgvector`.
 
-Both backends compile and ship in the workspace. Pick at construction time:
+Full decision guide, including what you give up either way: [FAQ → Should I use LMDB or Postgres?](./FAQ.md#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up).
+
+### Selecting the backend
+
+The same CLI binary and Python package handle both backends. Selection is driven by a `[store]` section in the shared `--profiles` TOML, with command-line / kwarg overrides.
+
+**TOML config** (`llm386.toml`):
+
+```toml
+[store]
+backend = "lmdb"
+path    = "./store"
+```
+
+or:
+
+```toml
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+schema  = "llm386"          # optional, defaults to public
+pool_size = 8               # optional, defaults to 8
+```
+
+**CLI** — `--store` for LMDB, `--pg-url` for Postgres. Either flag pinned in TOML, overridden by the matching flag, or supplied entirely on the command line:
+
+```bash
+# LMDB via flag (no config file needed):
+llm386 --store ./store page --session 1 --model gpt-4o --task "..."
+
+# Postgres via flag:
+llm386 --pg-url postgres://user@host/db page --session 1 --model gpt-4o --task "..."
+
+# Backend pinned in TOML; no flag needed:
+llm386 --profiles ./llm386.toml page --session 1 --model gpt-4o --task "..."
+```
+
+**Python** — positional `path` opens LMDB, the `url=` kwarg opens Postgres, or load `[store]` from a config:
+
+```python
+from llm386 import Store
+
+# LMDB:
+store = Store("./store")
+
+# Postgres:
+store = Store(url="postgres://user@host/db")
+
+# Backend from config:
+store = Store(profiles="./llm386.toml")
+```
+
+**Library** — open whichever concrete store you need and hand it to the pager / packer:
 
 ```rust
 use llm386_store_pg::{PgStore, PgStoreConfig};
@@ -129,9 +181,40 @@ let store = PgStore::open(
 )?;
 ```
 
-The schema is created on first connect; subsequent opens reuse the existing tables. Tests pass `schema: Some("my_test_schema".into())` to scope every pooled connection to an isolated schema via `SET search_path`.
+The Postgres schema bootstraps on first connect; subsequent opens reuse the existing tables. Tests pass `schema: Some("my_test_schema".into())` to scope every pooled connection to an isolated schema via `SET search_path`.
 
-`verify` / `repair` integrity tooling is intentionally not ported — Postgres has native equivalents (`pg_dump`, foreign-key checks, `REINDEX`, `VACUUM`).
+`verify` / `repair` integrity tooling is intentionally not ported — Postgres has native equivalents (`pg_dump`, foreign-key checks, `REINDEX`, `VACUUM`). The CLI errors cleanly when you try (`verify is LMDB-only (active backend: pg)`).
+
+### Async opt-in: `AsyncPgStore`
+
+`PgStore` implements the synchronous `BlockStore` trait that the rest of the workspace (pager, packer, trace) consumes. That works fine for single-request-at-a-time call patterns — but it means a single Postgres query at a time per call site, with the calling thread blocked on the socket.
+
+For service deployments handling many concurrent conversations, the `async` feature exposes a second store type backed by `tokio-postgres` + `deadpool-postgres`:
+
+```toml
+[dependencies]
+llm386-store-pg = { version = "...", features = ["async"] }
+```
+
+```rust
+use llm386_store_pg::{AsyncPgStore, PgStoreConfig};
+
+let store = AsyncPgStore::open(
+    "postgres://user:pass@host/db",
+    &PgStoreConfig::default(),
+).await?;
+
+// Concurrent puts share a small pool, pipelined down each socket:
+let (a, b, c) = tokio::try_join!(
+    store.put(session, block_a),
+    store.put(session, block_b),
+    store.put(session, block_c),
+)?;
+```
+
+`AsyncPgStore` **does not implement** the sync `BlockStore` trait — that's deliberate. Mixing async storage behind a sync trait would require `block_on` inside every call, defeating the point. Use `AsyncPgStore` directly from async call sites (axum handlers, tonic services, ingest pipelines) when you want real concurrency through a pool of connections. Keep using `PgStore` everywhere else, including as the storage backend handed to the pager / packer.
+
+The two stores share the schema, the migration logic, and `PgStoreConfig` — they're interchangeable in terms of on-disk state. You can write through one and read through the other against the same database.
 
 ### Performance
 
@@ -259,37 +342,39 @@ The CLI binary is `target/release/llm386`. Full subcommand reference: [`docs/CLI
 ```
 llm386 init ./store
 
-echo "You are a concise assistant." | llm386 put --store ./store --session 1 --kind system -
-echo "What is the capital of Australia?" | llm386 put --store ./store --session 1 --kind user-message -
-echo "Canberra." | llm386 put --store ./store --session 1 --kind assistant-message -
-echo "It became the capital in 1908." | llm386 put --store ./store --session 1 --kind fact -
+echo "You are a concise assistant." | llm386 --store ./store put --session 1 --kind system -
+echo "What is the capital of Australia?" | llm386 --store ./store put --session 1 --kind user-message -
+echo "Canberra." | llm386 --store ./store put --session 1 --kind assistant-message -
+echo "It became the capital in 1908." | llm386 --store ./store put --session 1 --kind fact -
 
 llm386 list-models
-llm386 page --store ./store --session 1 --model gpt-4o --task "explain Australia's history"
-llm386 pack --store ./store --session 1 --model gpt-4o --task "explain Australia's history"
+llm386 --store ./store page --session 1 --model gpt-4o --task "explain Australia's history"
+llm386 --store ./store pack --session 1 --model gpt-4o --task "explain Australia's history"
 ```
 
 `pack` prints the rendered prompt on stdout with a manifest header on stderr. Redirect with `> prompt.txt` to capture just the prompt.
+
+To run the same commands against Postgres, swap `--store ./store` for `--pg-url postgres://user@host/db` — every subcommand below works identically. Or pin the backend once in a TOML config and drop the flag (see [Selecting the backend](#selecting-the-backend)).
 
 ### Variants
 
 Render as JSON for a chat API:
 
 ```
-llm386 pack --store ./store --session 1 --model gpt-4o --task "..." --chat
+llm386 --store ./store pack --session 1 --model gpt-4o --task "..." --chat
 ```
 
 Record a trace and inspect it later:
 
 ```
-llm386 pack --store ./store --session 1 --model gpt-4o --task "..." --trace ./traces
-llm386 trace show --store ./traces <call-id>
+llm386 --store ./store pack --session 1 --model gpt-4o --task "..." --trace ./traces
+llm386 trace show --trace-store ./traces <call-id>
 ```
 
 Diff two trace records to see what changed between turns:
 
 ```
-llm386 trace diff --store ./traces <prev-call-id> <next-call-id>
+llm386 trace diff --trace-store ./traces <prev-call-id> <next-call-id>
 ```
 
 Output looks like `summary: +2 -1 ~1 (+184 tokens)` plus a per-block breakdown of additions, removals, and inclusion-reason changes.
@@ -297,9 +382,9 @@ Output looks like `summary: +2 -1 ~1 (+184 tokens)` plus a per-block breakdown o
 Add typed edges between blocks and inspect them:
 
 ```
-llm386 add-edge --store ./store --from <claim-id> --to <evidence-id> --kind supports
-llm386 edges --store ./store <claim-id>
-llm386 edges --store ./store <evidence-id> --incoming
+llm386 --store ./store add-edge --from <claim-id> --to <evidence-id> --kind supports
+llm386 --store ./store edges <claim-id>
+llm386 --store ./store edges <evidence-id> --incoming
 ```
 
 Edge kinds: `parent`, `derived-from`, `supports`, `contradicts`, `tool-invocation`. Re-adding the same triple is a no-op; deleting a block scrubs every edge that touches it.
@@ -307,28 +392,33 @@ Edge kinds: `parent`, `derived-from`, `supports`, `contradicts`, `tool-invocatio
 Inspect a single block:
 
 ```
-llm386 show --store ./store <block-id>
-llm386 show --store ./store <block-id> --json
+llm386 --store ./store show <block-id>
+llm386 --store ./store show <block-id> --json
 ```
 
 List sessions in a store:
 
 ```
-llm386 list-sessions --store ./store
+llm386 --store ./store list-sessions
 ```
 
 Summarize a session:
 
 ```
-llm386 summarize --store ./store --session 1 --summarizer truncating --max-chars 80
-ANTHROPIC_API_KEY=... llm386 summarize --store ./store --session 1 --summarizer anthropic --store-summary
+llm386 --store ./store summarize --session 1 --summarizer truncating --max-chars 80
+ANTHROPIC_API_KEY=... llm386 --store ./store summarize --session 1 --summarizer anthropic --store-summary
 ```
 
 ### Custom config
 
-A TOML file (passed via `--profiles <path>` or the `LLM386_PROFILES` environment variable) carries six optional sections:
+A TOML file (passed via `--profiles <path>` or the `LLM386_PROFILES` environment variable) carries seven optional sections:
 
 ```toml
+[store]
+backend = "lmdb"
+path    = "./store"
+# Or:  backend = "pg", url = "postgres://user@host/db", schema = "llm386"
+
 [[profile]]
 name = "my-tiny"
 max_context_tokens = 4096
@@ -363,7 +453,7 @@ include_timestamps = true
 stable_sections = ["system", "background"]
 ```
 
-`[[profile]]` adds model profiles on top of the built-ins. `[[hf_tokenizer]]` registers a HuggingFace tokenizer.json (used by Llama, Qwen, Mistral, and similar). `[[retriever]]` replaces the default retriever stack. `[section_budgets]` overrides the per-section fractions of the variable budget — fractions sum to ≤ 1.0, anything routed to `slack` is reserved headroom that is never filled. `[packer]` toggles opt-in packer behavior — `include_timestamps = true` prepends each rendered block with its ISO 8601 UTC creation timestamp and emits a "Current time" anchor in the Task section so the model can reason about *when* things happened, not just *what* was said. `[cache]` declares which sections (`system`, `state`, `plan`, `retrieved`, `background`) are considered stable across turns; `pack_chat` emits stable sections first and returns a `cache_boundary` index pointing at the last stable message, for downstream adapters to set provider cache markers (Anthropic `cache_control`, Gemini `CachedContent`). Default `stable_sections = ["system", "background"]`. See [`examples/configs/`](./examples/configs/) for three worked profiles (focused Q&A, chat loop, RAG-heavy).
+`[store]` pins the block-store backend (LMDB path or Postgres URL); the matching CLI flag (`--store` / `--pg-url`) and the Python `path=` / `url=` kwargs override it. `[[profile]]` adds model profiles on top of the built-ins. `[[hf_tokenizer]]` registers a HuggingFace tokenizer.json (used by Llama, Qwen, Mistral, and similar). `[[retriever]]` replaces the default retriever stack. `[section_budgets]` overrides the per-section fractions of the variable budget — fractions sum to ≤ 1.0, anything routed to `slack` is reserved headroom that is never filled. `[packer]` toggles opt-in packer behavior — `include_timestamps = true` prepends each rendered block with its ISO 8601 UTC creation timestamp and emits a "Current time" anchor in the Task section so the model can reason about *when* things happened, not just *what* was said. `[cache]` declares which sections (`system`, `state`, `plan`, `retrieved`, `background`) are considered stable across turns; `pack_chat` emits stable sections first and returns a `cache_boundary` index pointing at the last stable message, for downstream adapters to set provider cache markers (Anthropic `cache_control`, Gemini `CachedContent`). Default `stable_sections = ["system", "background"]`. See [`examples/configs/`](./examples/configs/) for three worked profiles (focused Q&A, chat loop, RAG-heavy).
 
 ### Library
 
@@ -515,7 +605,7 @@ The dependency direction is one-way: every impl crate depends on `llm386-core` f
 
 ## Status
 
-Early. The single-node embedded library and CLI work end to end against real LMDB and real tokenizers. The Postgres backend in this fork is feature-complete against the `BlockStore` trait (full parity with LMDB including `delete`, `purge_session`, `list_sessions`, edges in both directions) and is exercised by an integration test suite gated on `TEST_DATABASE_URL`. The bundled CLI and Python SDK still default to LMDB; selecting the PG backend is currently a library-level concern. Interfaces are stable enough for downstream consumers to build on, but expect breaking changes as new retrievers, summarizers, and storage backends land.
+Early. The single-node embedded library, CLI, and Python SDK all work end to end against both LMDB and Postgres. The Postgres backend in this fork is feature-complete against the `BlockStore` trait (full parity with LMDB including `delete`, `purge_session`, `list_sessions`, edges in both directions) and is exercised by an integration test suite gated on `TEST_DATABASE_URL`. The bundled CLI and Python SDK pick a backend via the same `[store]` TOML section (with `--store` / `--pg-url` / `url=` overrides); see [Selecting the backend](#selecting-the-backend). Interfaces are stable enough for downstream consumers to build on, but expect breaking changes as new retrievers, summarizers, and storage backends land.
 
 ## Non-goals
 

@@ -11,12 +11,24 @@ use clap::{Parser, Subcommand, ValueEnum};
     about = "LLM386 — context virtualization runtime"
 )]
 pub(crate) struct Cli {
-    /// Optional path to a TOML file with extra `[[profile]]` entries
-    /// merged into the built-in model registry. May also be set via
-    /// the `LLM386_PROFILES` environment variable; the flag wins
+    /// Optional path to a TOML file with `[[profile]]`,
+    /// `[[hf_tokenizer]]`, `[[retriever]]`, `[store]`, `[packer]`,
+    /// `[cache]`, and `[section_budgets]` entries. May also be set
+    /// via the `LLM386_PROFILES` environment variable; the flag wins
     /// when both are present.
     #[arg(long, global = true)]
     pub(crate) profiles: Option<PathBuf>,
+
+    /// LMDB block-store path. Overrides `path` in the TOML
+    /// `[store]` section. Mutually exclusive with `--pg-url`.
+    #[arg(long, global = true, conflicts_with = "pg_url")]
+    pub(crate) store: Option<PathBuf>,
+
+    /// PostgreSQL connection URL for the block store. Overrides
+    /// `url` in the TOML `[store]` section. Mutually exclusive with
+    /// `--store`.
+    #[arg(long, global = true)]
+    pub(crate) pg_url: Option<String>,
 
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -25,6 +37,7 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Create (or open) an LMDB store at the given path.
+    /// LMDB-only — Postgres bootstraps its schema on first connect.
     Init {
         /// Path to the store directory.
         path: PathBuf,
@@ -32,9 +45,6 @@ pub(crate) enum Command {
 
     /// Insert a block from a file (or `-` for stdin).
     Put {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Session id (decimal, or `0x`-prefixed hex).
         #[arg(long, value_parser = parse_u128)]
         session: u128,
@@ -53,8 +63,6 @@ pub(crate) enum Command {
 
     /// Run the pager and print the resulting plan.
     Page {
-        #[arg(long)]
-        store: PathBuf,
         #[arg(long, value_parser = parse_u128)]
         session: u128,
         /// Built-in model profile name (see `list-models`).
@@ -69,8 +77,6 @@ pub(crate) enum Command {
 
     /// Run page + pack and print the resulting prompt.
     Pack {
-        #[arg(long)]
-        store: PathBuf,
         #[arg(long, value_parser = parse_u128)]
         session: u128,
         #[arg(long)]
@@ -102,27 +108,17 @@ pub(crate) enum Command {
     Trace(TraceSub),
 
     /// List every session id with at least one block in the store.
-    ListSessions {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
-    },
+    ListSessions,
 
     /// Read-only integrity check: walks every block, recomputes
     /// content hashes, and verifies the indexes are consistent.
-    Verify {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
-    },
+    /// LMDB-only.
+    Verify,
 
     /// Rebuilds derivable indexes (hash index) from the primary
     /// table and removes orphan session entries. Destructive —
-    /// requires `--yes`.
+    /// requires `--yes`. LMDB-only.
     Repair {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Required confirmation flag.
         #[arg(long)]
         yes: bool,
@@ -131,9 +127,6 @@ pub(crate) enum Command {
     /// Delete a single block or every block in a session.
     /// Destructive — requires `--yes`.
     Purge {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Block id (decimal, hex with `0x`, or bare 32-char hex).
         /// Mutually exclusive with --session.
         #[arg(long, value_parser = parse_u128, conflicts_with = "session")]
@@ -149,9 +142,6 @@ pub(crate) enum Command {
 
     /// Print the full contents of a single block by id.
     Show {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Block id (decimal, hex with `0x`, or bare 32-char hex).
         #[arg(value_parser = parse_u128)]
         id: u128,
@@ -162,9 +152,6 @@ pub(crate) enum Command {
 
     /// Add a typed directed edge between two blocks.
     AddEdge {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Source block id (decimal, hex with `0x`, or bare 32-char hex).
         #[arg(long, value_parser = parse_u128)]
         from: u128,
@@ -178,9 +165,6 @@ pub(crate) enum Command {
 
     /// List edges incident to a block (outgoing by default).
     Edges {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Block id.
         #[arg(value_parser = parse_u128)]
         id: u128,
@@ -191,9 +175,6 @@ pub(crate) enum Command {
 
     /// Summarize a session's blocks via the configured summarizer.
     Summarize {
-        /// Path to the LMDB store.
-        #[arg(long)]
-        store: PathBuf,
         /// Session id (decimal, hex with `0x`, or bare 32-char hex).
         #[arg(long, value_parser = parse_u128)]
         session: u128,
@@ -223,8 +204,8 @@ pub(crate) enum Command {
 pub(crate) enum TraceSub {
     /// Show a single trace record by CallId.
     Show {
-        /// Path to the trace store.
-        #[arg(long)]
+        /// Path to the trace store (distinct from the block store).
+        #[arg(long = "trace-store")]
         store: PathBuf,
         /// Call id (decimal, or `0x`-prefixed hex).
         #[arg(value_parser = parse_u128)]
@@ -235,8 +216,8 @@ pub(crate) enum TraceSub {
     /// added, removed, or kept (and which kept-block selection
     /// reasons changed) plus the input-token delta.
     Diff {
-        /// Path to the trace store.
-        #[arg(long)]
+        /// Path to the trace store (distinct from the block store).
+        #[arg(long = "trace-store")]
         store: PathBuf,
         /// Older / baseline call id.
         #[arg(value_parser = parse_u128)]

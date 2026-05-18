@@ -21,6 +21,8 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39"] }
 llm386-core = { path = "../crates/llm386-core" }
 llm386-store-lmdb = { path = "../crates/llm386-store-lmdb" }
+llm386-store-pg = { path = "../crates/llm386-store-pg" }
+llm386-config = { path = "../crates/llm386-config" }
 llm386-tokenizer = { path = "../crates/llm386-tokenizer" }
 llm386-pager = { path = "../crates/llm386-pager" }
 llm386-packer = { path = "../crates/llm386-packer" }

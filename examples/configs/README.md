@@ -28,7 +28,7 @@ Or set the env var once for an entire shell session:
 
 ```
 export LLM386_PROFILES=$PWD/examples/configs/llm386-chat-loop.toml
-llm386 pack --store ./store --session 1 --model gpt-4o --task "..."
+llm386 --store ./store pack --session 1 --model gpt-4o --task "..."
 ```
 
 ## What `[section_budgets]` does
@@ -68,7 +68,7 @@ result = store.pack(session=1, model="gpt-4o", task="...", chat=True, timestamps
 ```
 
 ```
-llm386 pack --store ./store --session 1 --model gpt-4o --task "..." --timestamps
+llm386 --store ./store pack --session 1 --model gpt-4o --task "..." --timestamps
 ```
 
 The per-call flag overrides whatever's set in the config file.
@@ -89,17 +89,17 @@ The fastest way to check whether your tuning did what you expected is to compare
 
 ```
 # Run with one config:
-llm386 --profiles examples/configs/llm386-chat-loop.toml \
-    pack --store ./store --session 1 --model gpt-4o --task "..." \
+llm386 --profiles examples/configs/llm386-chat-loop.toml --store ./store \
+    pack --session 1 --model gpt-4o --task "..." \
     --trace ./traces
 
 # Run with a tighter config:
-llm386 --profiles examples/configs/llm386-focused-qa.toml \
-    pack --store ./store --session 1 --model gpt-4o --task "..." \
+llm386 --profiles examples/configs/llm386-focused-qa.toml --store ./store \
+    pack --session 1 --model gpt-4o --task "..." \
     --trace ./traces
 
 # Diff:
-llm386 trace diff --store ./traces <prev-call-id> <next-call-id>
+llm386 trace diff --trace-store ./traces <prev-call-id> <next-call-id>
 ```
 
 The diff shows which blocks were added, which were dropped, and the input-token delta — actionable signal for tightening or relaxing.

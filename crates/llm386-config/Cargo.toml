@@ -1,0 +1,22 @@
+[package]
+name = "llm386-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared TOML config schema + backend-selection helpers for the LLM386 CLI and Python wrapper."
+
+[lints]
+workspace = true
+
+[dependencies]
+llm386-core = { workspace = true }
+llm386-pager = { workspace = true }
+llm386-packer = { workspace = true }
+llm386-tokenizer = { workspace = true }
+llm386-store-lmdb = { workspace = true }
+llm386-store-pg = { workspace = true }
+serde = { workspace = true }
+toml = "1"

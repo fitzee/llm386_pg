@@ -11,6 +11,13 @@ description = "PostgreSQL-backed block and metadata storage for LLM386."
 [lints]
 workspace = true
 
+[features]
+default = []
+# Opt in to AsyncPgStore (tokio-postgres + deadpool). The sync PgStore
+# is always available; the async API is additional and inherent on its
+# own struct (it does not implement the sync BlockStore trait).
+async = ["dep:deadpool-postgres", "dep:tokio"]
+
 [dependencies]
 llm386-core = { workspace = true }
 thiserror = { workspace = true }
@@ -18,8 +25,19 @@ serde = { workspace = true }
 serde_json = "1"
 tracing = { workspace = true }
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
 
+# Async opt-in
+deadpool-postgres = { version = "0.14", optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[[test]]
+name = "async_smoke"
+path = "tests/async_smoke.rs"
+required-features = ["async"]

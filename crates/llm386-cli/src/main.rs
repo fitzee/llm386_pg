@@ -15,5 +15,5 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = cli::Cli::parse();
     let config = commands::load_config(args.profiles.as_deref())?;
-    commands::dispatch(args.command, &config)
+    commands::dispatch(args.command, args.store, args.pg_url, &config)
 }

@@ -1,26 +1,26 @@
 //! Subcommand handlers for `llm386`.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use llm386_compress::{NoopSummarizer, TruncatingSummarizer};
 use llm386_compress_anthropic::AnthropicSummarizer;
+use llm386_config::{
+    Applied, RetrieverEntry, StoreBackend, StoreEntry, build_retrievers, dispatch, open_backend,
+};
 use llm386_core::{
     BlockId, BlockKind, BlockStore, CallId, ContentHash, ContextBlock, ModelProfile, ModelRegistry,
-    Packer, PageRequest, Pager, Provenance, Retriever, SessionId, Summarizer, Timestamp,
-    TokenCounts, Tokenizer, TokenizerId, TraceRecord, TraceSink, default_registry,
+    Packer, PageRequest, Pager, Provenance, SessionId, Summarizer, Timestamp, TokenCounts,
+    Tokenizer, TraceRecord, TraceSink, default_registry,
 };
 use llm386_packer::SimplePacker;
-use llm386_pager::{
-    Bm25Retriever, GreedyPager, LexicalRetriever, RecencyRetriever, SessionRetriever,
-};
+use llm386_pager::GreedyPager;
 use llm386_store_lmdb::{LmdbStore, StoreConfig};
-use llm386_tokenizer::{HfTokenizer, TokenizerRegistry, default_registry as tokenizer_registry};
+use llm386_tokenizer::{TokenizerRegistry, default_registry as tokenizer_registry};
 use llm386_trace::LmdbTraceSink;
-use serde::Deserialize;
 
 use crate::cli::{Command, SummarizerArg, TraceSub};
 
@@ -37,316 +37,93 @@ pub(crate) struct LoadedConfig {
     pub retriever_entries: Vec<RetrieverEntry>,
     pub section_budgets: Option<llm386_pager::SectionBudgetTable>,
     pub packer_options: llm386_packer::PackerOptions,
+    /// Optional `[store]` from the TOML — combined with the global
+    /// `--store` / `--pg-url` flags by [`open_block_store`].
+    pub store: Option<StoreEntry>,
 }
 
-/// Load the built-in registries, then merge in any user-supplied
-/// `[[profile]]` and `[[hf_tokenizer]]` entries from
-/// `--profiles <path>` (or, if absent, the `LLM386_PROFILES` env
-/// var). User entries override built-ins with the same name.
+/// Load the built-in registries, then fold in user-supplied
+/// `[[profile]]` and `[[hf_tokenizer]]` entries from `--profiles
+/// <path>` (or, if absent, the `LLM386_PROFILES` env var).
 pub(crate) fn load_config(flag_path: Option<&Path>) -> Result<LoadedConfig> {
     let mut models = default_registry();
     let mut tokenizers = tokenizer_registry().context("initializing default tokenizer registry")?;
-    let mut retriever_entries: Vec<RetrieverEntry> = Vec::new();
-    let mut section_budgets: Option<llm386_pager::SectionBudgetTable> = None;
-    let mut packer_options = llm386_packer::PackerOptions::default();
 
     let path = flag_path
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os(PROFILES_ENV).map(std::path::PathBuf::from));
-    if let Some(path) = path {
-        let toml_str = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading config file at {}", path.display()))?;
-        let parsed = parse_config_toml(&toml_str)
-            .with_context(|| format!("parsing config file at {}", path.display()))?;
-        for profile in parsed.profiles {
-            models.register(profile);
+        .or_else(|| std::env::var_os(PROFILES_ENV).map(PathBuf::from));
+
+    let applied = if let Some(path) = path {
+        let parsed = llm386_config::parse(&path).map_err(|e| anyhow!(e))?;
+        llm386_config::apply(parsed, &mut models, &mut tokenizers).map_err(|e| anyhow!(e))?
+    } else {
+        Applied {
+            retrievers: Vec::new(),
+            section_budgets: None,
+            packer_options: None,
+            store: None,
         }
-        for entry in parsed.hf_tokenizers {
-            let tok = HfTokenizer::from_file(&entry.path, TokenizerId::new(&entry.name))
-                .with_context(|| {
-                    format!(
-                        "loading huggingface tokenizer `{}` from {}",
-                        entry.name,
-                        entry.path.display(),
-                    )
-                })?;
-            tokenizers.register(Arc::new(tok));
-        }
-        retriever_entries = parsed.retrievers;
-        section_budgets = parsed.section_budgets;
-        if let Some(p) = parsed.packer {
-            packer_options = p;
-        }
-        if let Some(c) = parsed.cache {
-            packer_options.cache = c;
-        }
-    }
+    };
 
     Ok(LoadedConfig {
         models,
         tokenizers,
-        retriever_entries,
-        section_budgets,
-        packer_options,
+        retriever_entries: applied.retrievers,
+        section_budgets: applied.section_budgets,
+        packer_options: applied.packer_options.unwrap_or_default(),
+        store: applied.store,
     })
 }
 
-#[derive(Default)]
-struct ParsedConfig {
-    profiles: Vec<ModelProfile>,
-    hf_tokenizers: Vec<HfTokenizerEntry>,
-    retrievers: Vec<RetrieverEntry>,
-    section_budgets: Option<llm386_pager::SectionBudgetTable>,
-    packer: Option<llm386_packer::PackerOptions>,
-    cache: Option<llm386_packer::CacheOptions>,
+/// Resolve the chosen block store from TOML `[store]` + global CLI
+/// flags. Called by every subcommand that touches block storage.
+fn open_block_store(
+    config: &LoadedConfig,
+    cli_store: Option<PathBuf>,
+    cli_pg_url: Option<String>,
+) -> Result<StoreBackend> {
+    open_backend(config.store.clone(), cli_store, cli_pg_url).map_err(|e| anyhow!(e))
 }
 
-#[derive(Deserialize)]
-struct ConfigFile {
-    #[serde(default)]
-    profile: Vec<ModelProfile>,
-    #[serde(default)]
-    hf_tokenizer: Vec<HfTokenizerEntry>,
-    #[serde(default)]
-    retriever: Vec<RetrieverEntry>,
-    #[serde(default)]
-    section_budgets: Option<SectionBudgetEntry>,
-    #[serde(default)]
-    packer: Option<PackerEntry>,
-    #[serde(default)]
-    cache: Option<CacheEntry>,
-}
-
-/// `[packer]` table — opt-in packer behavior knobs. Mirrors
-/// [`llm386_packer::PackerOptions`].
-#[derive(Default, Deserialize)]
-struct PackerEntry {
-    /// When `true`, prepend each rendered block with its `created_at`
-    /// timestamp in ISO 8601 UTC, and emit a `Current time:` anchor
-    /// at the start of the Task section.
-    #[serde(default)]
-    include_timestamps: bool,
-}
-
-impl PackerEntry {
-    fn build(self) -> llm386_packer::PackerOptions {
-        llm386_packer::PackerOptions {
-            include_timestamps: self.include_timestamps,
-            now_ms: None,
-            cache: llm386_packer::CacheOptions::default(),
-        }
-    }
-}
-
-/// `[cache]` table — prompt-cache knobs for `pack_chat`.
-///
-/// `stable_sections` lists which sections are considered stable
-/// across turns. Section names are lowercased SectionKind variants:
-/// `"system"`, `"state"`, `"plan"`, `"retrieved"`, `"background"`.
-/// Sections outside this list are emitted after the stable prefix
-/// so they don't break the cache key.
-#[derive(Default, Deserialize)]
-struct CacheEntry {
-    #[serde(default)]
-    stable_sections: Option<Vec<String>>,
-}
-
-impl CacheEntry {
-    fn build(self) -> Result<llm386_packer::CacheOptions> {
-        use llm386_core::SectionKind;
-        let mut out = llm386_packer::CacheOptions::default();
-        if let Some(names) = self.stable_sections {
-            let mut sections = Vec::with_capacity(names.len());
-            for name in names {
-                let s = match name.to_ascii_lowercase().as_str() {
-                    "system" => SectionKind::System,
-                    "state" => SectionKind::State,
-                    "plan" => SectionKind::Plan,
-                    "retrieved" => SectionKind::Retrieved,
-                    "background" => SectionKind::Background,
-                    other => {
-                        return Err(anyhow!(
-                            "[cache].stable_sections: unsupported section `{other}` — valid: system, state, plan, retrieved, background",
-                        ));
-                    }
-                };
-                sections.push(s);
-            }
-            out.stable_sections = sections;
-        }
-        Ok(out)
-    }
-}
-
-/// `[section_budgets]` table — fractions of the variable budget per
-/// section. Any field omitted defaults to 0.0 and that section gets no
-/// allocation. Sums above 1.0 are normalized down at allocation time.
-#[derive(Default, Deserialize)]
-struct SectionBudgetEntry {
-    #[serde(default)]
-    state: Option<f32>,
-    #[serde(default)]
-    plan: Option<f32>,
-    #[serde(default)]
-    recent: Option<f32>,
-    #[serde(default)]
-    retrieved: Option<f32>,
-    #[serde(default)]
-    tools: Option<f32>,
-    #[serde(default)]
-    background: Option<f32>,
-    #[serde(default)]
-    slack: Option<f32>,
-}
-
-impl SectionBudgetEntry {
-    fn build(self) -> llm386_pager::SectionBudgetTable {
-        use llm386_core::SectionKind;
-        let mut table = llm386_pager::SectionBudgetTable::empty();
-        if let Some(v) = self.state {
-            table.set(SectionKind::State, v);
-        }
-        if let Some(v) = self.plan {
-            table.set(SectionKind::Plan, v);
-        }
-        if let Some(v) = self.recent {
-            table.set(SectionKind::Recent, v);
-        }
-        if let Some(v) = self.retrieved {
-            table.set(SectionKind::Retrieved, v);
-        }
-        if let Some(v) = self.tools {
-            table.set(SectionKind::Tools, v);
-        }
-        if let Some(v) = self.background {
-            table.set(SectionKind::Background, v);
-        }
-        if let Some(v) = self.slack {
-            table.set(SectionKind::Slack, v);
-        }
-        table
-    }
-}
-
-#[derive(Deserialize)]
-struct HfTokenizerEntry {
-    name: String,
-    path: std::path::PathBuf,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct RetrieverEntry {
-    pub kind: String,
-    /// RecencyRetriever: switch to exponential decay if set.
-    #[serde(default)]
-    pub half_life_secs: Option<f32>,
-    /// LexicalRetriever / Bm25Retriever: minimum query/document
-    /// token length.
-    #[serde(default)]
-    pub min_word_len: Option<usize>,
-    /// Bm25Retriever: term-frequency saturation parameter.
-    #[serde(default)]
-    pub k1: Option<f32>,
-    /// Bm25Retriever: length-normalization parameter.
-    #[serde(default)]
-    pub b: Option<f32>,
-    /// SessionRetriever: flat baseline score for every block.
-    #[serde(default)]
-    pub score: Option<f32>,
-}
-
-fn parse_config_toml(s: &str) -> Result<ParsedConfig> {
-    let parsed: ConfigFile = toml::from_str(s)?;
-    let cache = parsed.cache.map(CacheEntry::build).transpose()?;
-    Ok(ParsedConfig {
-        profiles: parsed.profile,
-        hf_tokenizers: parsed.hf_tokenizer,
-        retrievers: parsed.retriever,
-        section_budgets: parsed.section_budgets.map(SectionBudgetEntry::build),
-        packer: parsed.packer.map(PackerEntry::build),
-        cache,
-    })
-}
-
-/// Materialize the retriever set declared in the config, bound to
-/// `store`. Returns `None` when no `[[retriever]]` entries were
-/// configured — callers fall back to the GreedyPager default
-/// (RecencyRetriever).
-fn build_retrievers(
-    entries: &[RetrieverEntry],
-    store: &Arc<LmdbStore>,
-) -> Result<Option<Vec<Arc<dyn Retriever>>>> {
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    let mut out: Vec<Arc<dyn Retriever>> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let r: Arc<dyn Retriever> = match entry.kind.as_str() {
-            "recency" => {
-                let mut r = RecencyRetriever::new(store.clone());
-                if let Some(h) = entry.half_life_secs {
-                    r = r.with_half_life(h);
-                }
-                Arc::new(r)
-            }
-            "lexical" => {
-                let mut r = LexicalRetriever::new(store.clone());
-                if let Some(n) = entry.min_word_len {
-                    r = r.with_min_word_len(n);
-                }
-                Arc::new(r)
-            }
-            "bm25" => {
-                let mut r = Bm25Retriever::new(store.clone());
-                if let Some(k) = entry.k1 {
-                    r = r.with_k1(k);
-                }
-                if let Some(b) = entry.b {
-                    r = r.with_b(b);
-                }
-                if let Some(n) = entry.min_word_len {
-                    r = r.with_min_word_len(n);
-                }
-                Arc::new(r)
-            }
-            "session" => {
-                let mut r = SessionRetriever::new(store.clone());
-                if let Some(s) = entry.score {
-                    r = r.with_score(s);
-                }
-                Arc::new(r)
-            }
-            other => {
-                return Err(anyhow!(
-                    "unknown retriever kind `{other}`; expected one of: recency, lexical, bm25, session",
-                ));
-            }
-        };
-        out.push(r);
-    }
-    Ok(Some(out))
-}
-
-pub(crate) fn dispatch(command: Command, config: &LoadedConfig) -> Result<()> {
+pub(crate) fn dispatch(
+    command: Command,
+    cli_store: Option<PathBuf>,
+    cli_pg_url: Option<String>,
+    config: &LoadedConfig,
+) -> Result<()> {
+    // Commands that don't need a block-store backend.
     match command {
-        Command::Init { path } => init(&path),
+        Command::Init { path } => return init(&path),
+        Command::ListModels => return list_models(&config.models),
+        Command::Trace(TraceSub::Show { store, call_id }) => {
+            return trace_show(&store, CallId(call_id));
+        }
+        Command::Trace(TraceSub::Diff { store, prev, next }) => {
+            return trace_diff(&store, CallId(prev), CallId(next));
+        }
+        _ => {}
+    }
+
+    // Everything below operates on the block store. Open it once.
+    let backend = open_block_store(config, cli_store, cli_pg_url)?;
+
+    match command {
+        Command::Init { .. } | Command::ListModels | Command::Trace(_) => {
+            unreachable!("handled above")
+        }
         Command::Put {
-            store,
             session,
             kind,
             priority,
             file,
-        } => put(&store, SessionId(session), kind.into(), priority, &file),
-        Command::ListModels => list_models(&config.models),
+        } => put(&backend, SessionId(session), kind.into(), priority, &file),
         Command::Page {
-            store,
             session,
             model,
             task,
             json,
-        } => page(&store, SessionId(session), &model, &task, json, config),
+        } => page(&backend, SessionId(session), &model, &task, json, config),
         Command::Pack {
-            store,
             session,
             model,
             task,
@@ -355,7 +132,7 @@ pub(crate) fn dispatch(command: Command, config: &LoadedConfig) -> Result<()> {
             timestamps,
             trace,
         } => pack(
-            &store,
+            &backend,
             SessionId(session),
             &model,
             &task,
@@ -365,33 +142,20 @@ pub(crate) fn dispatch(command: Command, config: &LoadedConfig) -> Result<()> {
             trace.as_deref(),
             config,
         ),
-        Command::Trace(TraceSub::Show { store, call_id }) => trace_show(&store, CallId(call_id)),
-        Command::Trace(TraceSub::Diff { store, prev, next }) => {
-            trace_diff(&store, CallId(prev), CallId(next))
-        }
-        Command::ListSessions { store } => list_sessions(&store),
-        Command::Verify { store } => verify(&store),
-        Command::Repair { store, yes } => repair(&store, yes),
+        Command::ListSessions => list_sessions(&backend),
+        Command::Verify => verify(&backend),
+        Command::Repair { yes } => repair(&backend, yes),
         Command::Purge {
-            store,
             block,
             session,
             yes,
-        } => purge(&store, block, session, yes),
-        Command::Show { store, id, json } => show(&store, BlockId(id), json),
-        Command::AddEdge {
-            store,
-            from,
-            to,
-            kind,
-        } => add_edge(&store, BlockId(from), BlockId(to), kind.into()),
-        Command::Edges {
-            store,
-            id,
-            incoming,
-        } => edges(&store, BlockId(id), incoming),
+        } => purge(&backend, block, session, yes),
+        Command::Show { id, json } => show(&backend, BlockId(id), json),
+        Command::AddEdge { from, to, kind } => {
+            add_edge(&backend, BlockId(from), BlockId(to), kind.into())
+        }
+        Command::Edges { id, incoming } => edges(&backend, BlockId(id), incoming),
         Command::Summarize {
-            store,
             session,
             summarizer,
             max_chars,
@@ -400,7 +164,7 @@ pub(crate) fn dispatch(command: Command, config: &LoadedConfig) -> Result<()> {
             anthropic_model,
             anthropic_max_tokens,
         } => summarize(&SummarizeArgs {
-            store_path: &store,
+            backend: &backend,
             session: SessionId(session),
             summarizer,
             max_chars,
@@ -415,12 +179,12 @@ pub(crate) fn dispatch(command: Command, config: &LoadedConfig) -> Result<()> {
 fn init(path: &Path) -> Result<()> {
     let _store = LmdbStore::open(path, StoreConfig::default())
         .with_context(|| format!("opening store at {}", path.display()))?;
-    println!("initialized store at {}", path.display());
+    println!("initialized LMDB store at {}", path.display());
     Ok(())
 }
 
 fn put(
-    store_path: &Path,
+    backend: &StoreBackend,
     session: SessionId,
     kind: BlockKind,
     priority: f32,
@@ -436,9 +200,6 @@ fn put(
         std::fs::read(file).with_context(|| format!("reading {}", file.display()))?
     };
 
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
-
     let id = new_block_id();
     let now = Timestamp(now_ms());
     let block = ContextBlock {
@@ -452,7 +213,7 @@ fn put(
         provenance: Provenance::default(),
         hash: ContentHash::of(&bytes),
     };
-    let stored = store.put(session, block)?;
+    let stored = dispatch!(backend, |s| s.put(session, block))?;
     println!("{stored}");
     Ok(())
 }
@@ -478,28 +239,61 @@ fn list_models(reg: &ModelRegistry) -> Result<()> {
     Ok(())
 }
 
+fn profile_and_tokenizer(
+    config: &LoadedConfig,
+    model_name: &str,
+) -> Result<(ModelProfile, Arc<dyn Tokenizer>)> {
+    let profile = config
+        .models
+        .get(model_name)
+        .ok_or_else(|| anyhow!("unknown model: {model_name}"))?
+        .clone();
+    let tokenizer = config.tokenizers.get(&profile.tokenizer).ok_or_else(|| {
+        anyhow!(
+            "no tokenizer adapter for {} (used by model {})",
+            profile.tokenizer,
+            profile.name,
+        )
+    })?;
+    Ok((profile, tokenizer))
+}
+
+/// Build a configured `GreedyPager<S>` for a concrete backend.
+fn make_pager<S: BlockStore + 'static>(
+    store: &Arc<S>,
+    tokenizer: Arc<dyn Tokenizer>,
+    config: &LoadedConfig,
+) -> Result<GreedyPager<S>> {
+    let mut pager = GreedyPager::new(store.clone(), tokenizer);
+    if let Some(retrievers) =
+        build_retrievers(&config.retriever_entries, store).map_err(|e| anyhow!(e))?
+    {
+        pager = pager.with_retrievers(retrievers);
+    }
+    if let Some(budgets) = &config.section_budgets {
+        pager = pager.with_budgets(budgets.clone());
+    }
+    Ok(pager)
+}
+
 fn page(
-    store_path: &Path,
+    backend: &StoreBackend,
     session: SessionId,
     model_name: &str,
     task: &str,
     json: bool,
     config: &LoadedConfig,
 ) -> Result<()> {
-    let (store, profile, tokenizer) = open_for_model(store_path, model_name, config)?;
-    let mut pager = GreedyPager::new(store.clone(), tokenizer);
-    if let Some(retrievers) = build_retrievers(&config.retriever_entries, &store)? {
-        pager = pager.with_retrievers(retrievers);
-    }
-    if let Some(budgets) = &config.section_budgets {
-        pager = pager.with_budgets(budgets.clone());
-    }
-    let plan = pager.page(PageRequest {
-        session_id: session,
-        task: task.to_string(),
-        model: profile,
-        required_blocks: vec![],
-    })?;
+    let (profile, tokenizer) = profile_and_tokenizer(config, model_name)?;
+    let plan = dispatch!(backend, |s| {
+        let pager = make_pager(s, tokenizer, config)?;
+        pager.page(PageRequest {
+            session_id: session,
+            task: task.to_string(),
+            model: profile,
+            required_blocks: vec![],
+        })?
+    });
 
     if json {
         println!(
@@ -523,7 +317,7 @@ fn page(
 
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)] // CLI flags map 1:1 to handler args; refactoring to a struct buys nothing here.
 fn pack(
-    store_path: &Path,
+    backend: &StoreBackend,
     session: SessionId,
     model_name: &str,
     task: &str,
@@ -533,19 +327,7 @@ fn pack(
     trace_path: Option<&Path>,
     config: &LoadedConfig,
 ) -> Result<()> {
-    let (store, profile, tokenizer) = open_for_model(store_path, model_name, config)?;
-    let mut pager = GreedyPager::new(store.clone(), tokenizer.clone());
-    if let Some(retrievers) = build_retrievers(&config.retriever_entries, &store)? {
-        pager = pager.with_retrievers(retrievers);
-    }
-    if let Some(budgets) = &config.section_budgets {
-        pager = pager.with_budgets(budgets.clone());
-    }
-    let mut packer_options = config.packer_options.clone();
-    if timestamps_flag {
-        packer_options.include_timestamps = true;
-    }
-    let packer = SimplePacker::new(store, tokenizer).with_options(packer_options);
+    let (profile, tokenizer) = profile_and_tokenizer(config, model_name)?;
 
     let request = PageRequest {
         session_id: session,
@@ -553,11 +335,36 @@ fn pack(
         model: profile,
         required_blocks: vec![],
     };
-
+    let mut packer_options = config.packer_options.clone();
+    if timestamps_flag {
+        packer_options.include_timestamps = true;
+    }
     let started_at = Timestamp(now_ms());
     let started = Instant::now();
-    let plan = pager.page(request.clone())?;
-    let prompt = packer.pack(&request, &plan)?;
+
+    let (plan, prompt_rendered, prompt_input_tokens, chat_prompt_json) =
+        dispatch!(backend, |s| {
+            let pager = make_pager(s, tokenizer.clone(), config)?;
+            let packer =
+                SimplePacker::new(s.clone(), tokenizer.clone()).with_options(packer_options.clone());
+            let plan = pager.page(request.clone())?;
+            let prompt = packer.pack(&request, &plan)?;
+            let chat_json = if chat {
+                let chat_prompt = packer.pack_chat(&request, &plan)?;
+                Some((
+                    chat_prompt.model.clone(),
+                    chat_prompt.input_tokens,
+                    chat_prompt.messages.len(),
+                    chat_prompt.cache_boundary,
+                    serde_json::to_string_pretty(&chat_prompt)
+                        .context("serializing chat prompt")?,
+                ))
+            } else {
+                None
+            };
+            (plan, prompt.rendered, prompt.input_tokens, chat_json)
+        });
+
     let duration_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
     let trace_id = if let Some(path) = trace_path {
@@ -569,8 +376,8 @@ fn pack(
             session,
             model: request.model.name.clone(),
             plan: plan.clone(),
-            prompt_tokens: prompt.input_tokens,
-            prompt_hash: ContentHash::of(prompt.rendered.as_bytes()),
+            prompt_tokens: prompt_input_tokens,
+            prompt_hash: ContentHash::of(prompt_rendered.as_bytes()),
             started_at,
             duration_ms,
             model_version: request.model.name.clone(),
@@ -583,13 +390,13 @@ fn pack(
         None
     };
 
-    if chat {
-        // Re-render the same plan as role-tagged messages.
-        let chat_prompt = packer.pack_chat(&request, &plan)?;
-        eprintln!("# model:          {}", chat_prompt.model);
-        eprintln!("# input_tokens:   {}", chat_prompt.input_tokens);
-        eprintln!("# messages:       {}", chat_prompt.messages.len());
-        match chat_prompt.cache_boundary {
+    if let Some((model_name, input_tokens, message_count, cache_boundary, json)) =
+        chat_prompt_json
+    {
+        eprintln!("# model:          {model_name}");
+        eprintln!("# input_tokens:   {input_tokens}");
+        eprintln!("# messages:       {message_count}");
+        match cache_boundary {
             Some(n) => eprintln!("# cache_boundary: {n} (messages[0..={n}] cacheable)"),
             None => eprintln!("# cache_boundary: none"),
         }
@@ -598,27 +405,24 @@ fn pack(
             eprintln!("# trace_id:       {id}");
         }
         eprintln!("---");
-        let json = serde_json::to_string_pretty(&chat_prompt)
-            .context("serializing chat prompt")?;
         println!("{json}");
     } else if prompt_only {
-        print!("{}", prompt.rendered);
+        print!("{prompt_rendered}");
     } else {
-        eprintln!("# model:         {}", prompt.model);
-        eprintln!("# input_tokens:  {}", prompt.input_tokens);
-        eprintln!("# blocks:        {}", prompt.blocks.len());
+        eprintln!("# model:         {}", request.model.name);
+        eprintln!("# input_tokens:  {prompt_input_tokens}");
         eprintln!("# duration_ms:   {duration_ms}");
         if let Some(id) = trace_id {
             eprintln!("# trace_id:      {id}");
         }
         eprintln!("---");
-        print!("{}", prompt.rendered);
+        print!("{prompt_rendered}");
     }
     Ok(())
 }
 
 struct SummarizeArgs<'a> {
-    store_path: &'a Path,
+    backend: &'a StoreBackend,
     session: SessionId,
     summarizer: SummarizerArg,
     max_chars: usize,
@@ -629,10 +433,7 @@ struct SummarizeArgs<'a> {
 }
 
 fn summarize(args: &SummarizeArgs<'_>) -> Result<()> {
-    let store = LmdbStore::open(args.store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", args.store_path.display()))?;
-
-    let mut ids = store.list_session(args.session)?;
+    let mut ids = dispatch!(args.backend, |s| s.list_session(args.session))?;
     ids.sort(); // BlockId order is chronological.
     if let Some(n) = args.last {
         let from = ids.len().saturating_sub(n);
@@ -640,7 +441,7 @@ fn summarize(args: &SummarizeArgs<'_>) -> Result<()> {
     }
     let mut blocks: Vec<ContextBlock> = Vec::with_capacity(ids.len());
     for &id in &ids {
-        if let Some(b) = store.get(id)? {
+        if let Some(b) = dispatch!(args.backend, |s| s.get(id))? {
             blocks.push(b);
         }
     }
@@ -688,26 +489,25 @@ fn summarize(args: &SummarizeArgs<'_>) -> Result<()> {
             },
             hash: ContentHash::of(&bytes),
         };
-        let stored = store.put(args.session, block)?;
+        let stored = dispatch!(args.backend, |s| s.put(args.session, block))?;
         eprintln!("# summary stored: {stored}");
     }
 
     Ok(())
 }
 
-fn list_sessions(store_path: &Path) -> Result<()> {
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
-    let sessions = store.list_sessions()?;
+fn list_sessions(backend: &StoreBackend) -> Result<()> {
+    let sessions = dispatch!(backend, |s| s.list_sessions())?;
     for s in sessions {
         println!("{s}");
     }
     Ok(())
 }
 
-fn verify(store_path: &Path) -> Result<()> {
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
+fn verify(backend: &StoreBackend) -> Result<()> {
+    let store = backend
+        .as_lmdb()
+        .map_err(|label| anyhow!("verify is LMDB-only (active backend: {label})"))?;
     let report = store.verify()?;
     println!("blocks checked:           {}", report.blocks_checked);
     println!("hash mismatches:          {}", report.hash_mismatches.len());
@@ -747,12 +547,13 @@ fn verify(store_path: &Path) -> Result<()> {
     }
 }
 
-fn repair(store_path: &Path, yes: bool) -> Result<()> {
+fn repair(backend: &StoreBackend, yes: bool) -> Result<()> {
     if !yes {
         return Err(anyhow!("destructive operation: pass --yes to confirm"));
     }
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
+    let store = backend
+        .as_lmdb()
+        .map_err(|label| anyhow!("repair is LMDB-only (active backend: {label})"))?;
     let report = store.repair()?;
     println!(
         "hash index rebuilt:                  {}",
@@ -783,7 +584,12 @@ fn repair(store_path: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn purge(store_path: &Path, block: Option<u128>, session: Option<u128>, yes: bool) -> Result<()> {
+fn purge(
+    backend: &StoreBackend,
+    block: Option<u128>,
+    session: Option<u128>,
+    yes: bool,
+) -> Result<()> {
     if !yes {
         return Err(anyhow!("destructive operation: pass --yes to confirm"));
     }
@@ -792,9 +598,7 @@ fn purge(store_path: &Path, block: Option<u128>, session: Option<u128>, yes: boo
             Err(anyhow!("specify exactly one of --block or --session"))
         }
         (Some(id), None) => {
-            let store = LmdbStore::open(store_path, StoreConfig::default())
-                .with_context(|| format!("opening store at {}", store_path.display()))?;
-            let deleted = store.delete(BlockId(id))?;
+            let deleted = dispatch!(backend, |s| s.delete(BlockId(id)))?;
             if deleted {
                 println!("deleted block {}", BlockId(id));
             } else {
@@ -803,20 +607,15 @@ fn purge(store_path: &Path, block: Option<u128>, session: Option<u128>, yes: boo
             Ok(())
         }
         (None, Some(sid)) => {
-            let store = LmdbStore::open(store_path, StoreConfig::default())
-                .with_context(|| format!("opening store at {}", store_path.display()))?;
-            let count = store.purge_session(SessionId(sid))?;
+            let count = dispatch!(backend, |s| s.purge_session(SessionId(sid)))?;
             println!("purged {count} blocks from session {}", SessionId(sid));
             Ok(())
         }
     }
 }
 
-fn show(store_path: &Path, id: BlockId, json: bool) -> Result<()> {
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
-    let block = store
-        .get(id)?
+fn show(backend: &StoreBackend, id: BlockId, json: bool) -> Result<()> {
+    let block = dispatch!(backend, |s| s.get(id))?
         .ok_or_else(|| anyhow!("block not found: {id}"))?;
 
     if json {
@@ -868,7 +667,6 @@ fn show(store_path: &Path, id: BlockId, json: bool) -> Result<()> {
             println!();
         }
     } else {
-        // Binary body — hex dump first 256 bytes.
         for chunk in block.bytes.chunks(16).take(16) {
             for b in chunk {
                 print!("{b:02x} ");
@@ -929,25 +727,21 @@ fn trace_diff(store_path: &Path, prev: CallId, next: CallId) -> Result<()> {
 }
 
 fn add_edge(
-    store_path: &Path,
+    backend: &StoreBackend,
     from: BlockId,
     to: BlockId,
     kind: llm386_core::EdgeKind,
 ) -> Result<()> {
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
-    store.put_edge(llm386_core::Edge { from, to, kind })?;
+    dispatch!(backend, |s| s.put_edge(llm386_core::Edge { from, to, kind }))?;
     println!("edge added: {from} --{kind:?}--> {to}");
     Ok(())
 }
 
-fn edges(store_path: &Path, id: BlockId, incoming: bool) -> Result<()> {
-    let store = LmdbStore::open(store_path, StoreConfig::default())
-        .with_context(|| format!("opening store at {}", store_path.display()))?;
+fn edges(backend: &StoreBackend, id: BlockId, incoming: bool) -> Result<()> {
     let edges = if incoming {
-        store.edges_to(id)?
+        dispatch!(backend, |s| s.edges_to(id))?
     } else {
-        store.edges_from(id)?
+        dispatch!(backend, |s| s.edges_from(id))?
     };
     if edges.is_empty() {
         println!("no edges");
@@ -985,30 +779,6 @@ fn trace_show(store_path: &Path, call_id: CallId) -> Result<()> {
     Ok(())
 }
 
-fn open_for_model(
-    store_path: &Path,
-    model_name: &str,
-    config: &LoadedConfig,
-) -> Result<(Arc<LmdbStore>, ModelProfile, Arc<dyn Tokenizer>)> {
-    let store = Arc::new(
-        LmdbStore::open(store_path, StoreConfig::default())
-            .with_context(|| format!("opening store at {}", store_path.display()))?,
-    );
-    let profile = config
-        .models
-        .get(model_name)
-        .ok_or_else(|| anyhow!("unknown model profile: {model_name}"))?
-        .clone();
-    let tokenizer = config.tokenizers.get(&profile.tokenizer).ok_or_else(|| {
-        anyhow!(
-            "no tokenizer adapter for {} (used by model {}); register one via [[hf_tokenizer]] in the config file",
-            profile.tokenizer,
-            profile.name,
-        )
-    })?;
-    Ok((store, profile, tokenizer))
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1017,129 +787,12 @@ fn now_ms() -> u64 {
 
 fn new_block_id() -> BlockId {
     let mut buf = [0u8; 16];
-    getrandom::fill(&mut buf).expect("getrandom should not fail");
+    getrandom::fill(&mut buf).expect("getrandom failed");
     BlockId::from_parts(now_ms(), u128::from_be_bytes(buf))
 }
 
 fn new_call_id() -> CallId {
     let mut buf = [0u8; 16];
-    getrandom::fill(&mut buf).expect("getrandom should not fail");
+    getrandom::fill(&mut buf).expect("getrandom failed");
     CallId(u128::from_be_bytes(buf))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_config_toml_basic_profile() {
-        let s = r#"
-[[profile]]
-name = "my-model"
-max_context_tokens = 64000
-reserved_output_tokens = 8000
-tokenizer = "o200k_base"
-"#;
-        let parsed = parse_config_toml(s).unwrap();
-        assert_eq!(parsed.profiles.len(), 1);
-        let p = &parsed.profiles[0];
-        assert_eq!(p.name, "my-model");
-        assert_eq!(p.max_context_tokens, 64_000);
-        assert_eq!(p.reserved_output_tokens, 8_000);
-        // Defaults applied.
-        assert_eq!(p.safety_margin_tokens, 0);
-        assert!(p.supports_system_role);
-        assert!(p.supports_tools);
-        assert_eq!(p.tokenizer.as_str(), "o200k_base");
-    }
-
-    #[test]
-    fn parse_config_toml_explicit_fields() {
-        let s = r#"
-[[profile]]
-name = "strict"
-max_context_tokens = 1000
-reserved_output_tokens = 100
-safety_margin_tokens = 50
-tokenizer = "cl100k_base"
-supports_system_role = false
-supports_tools = false
-"#;
-        let p = parse_config_toml(s)
-            .unwrap()
-            .profiles
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(p.safety_margin_tokens, 50);
-        assert!(!p.supports_system_role);
-        assert!(!p.supports_tools);
-    }
-
-    #[test]
-    fn parse_config_toml_empty_file_yields_empty_vecs() {
-        let parsed = parse_config_toml("").unwrap();
-        assert!(parsed.profiles.is_empty());
-        assert!(parsed.hf_tokenizers.is_empty());
-    }
-
-    #[test]
-    fn parse_config_toml_rejects_profile_missing_required_field() {
-        // No `tokenizer` field — should fail.
-        let s = r#"
-[[profile]]
-name = "broken"
-max_context_tokens = 100
-reserved_output_tokens = 10
-"#;
-        assert!(parse_config_toml(s).is_err());
-    }
-
-    #[test]
-    fn parse_config_toml_loads_retriever_entries() {
-        let s = r#"
-[[retriever]]
-kind = "recency"
-half_life_secs = 60.0
-
-[[retriever]]
-kind = "bm25"
-k1 = 1.5
-b = 0.5
-min_word_len = 3
-
-[[retriever]]
-kind = "lexical"
-
-[[retriever]]
-kind = "session"
-score = 0.25
-"#;
-        let parsed = parse_config_toml(s).unwrap();
-        assert_eq!(parsed.retrievers.len(), 4);
-        assert_eq!(parsed.retrievers[0].kind, "recency");
-        assert_eq!(parsed.retrievers[0].half_life_secs, Some(60.0));
-        assert_eq!(parsed.retrievers[1].kind, "bm25");
-        assert_eq!(parsed.retrievers[1].k1, Some(1.5));
-        assert_eq!(parsed.retrievers[2].kind, "lexical");
-        assert_eq!(parsed.retrievers[3].kind, "session");
-        assert_eq!(parsed.retrievers[3].score, Some(0.25));
-    }
-
-    #[test]
-    fn parse_config_toml_loads_hf_tokenizer_entries() {
-        let s = r#"
-[[hf_tokenizer]]
-name = "llama-3"
-path = "/tmp/llama-3-tokenizer.json"
-
-[[hf_tokenizer]]
-name = "qwen-2.5"
-path = "/tmp/qwen-2.5-tokenizer.json"
-"#;
-        let parsed = parse_config_toml(s).unwrap();
-        assert_eq!(parsed.hf_tokenizers.len(), 2);
-        assert_eq!(parsed.hf_tokenizers[0].name, "llama-3");
-        assert_eq!(parsed.hf_tokenizers[1].name, "qwen-2.5");
-    }
 }

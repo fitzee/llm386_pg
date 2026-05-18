@@ -3,6 +3,7 @@
 ## Quick index
 
 - What does the model see? → [How it works](#how-it-works)
+- LMDB or Postgres? → [Choosing a block-store backend](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up)
 - How fast is it? → [Performance and sizing](#performance-and-sizing)
 - Will it fill the entire context window? → [Does the runtime pack only what's needed?](#does-the-runtime-pack-only-whats-needed-or-does-it-fill-the-models-context-window)
 - Does it lower token cost? → [Cost and prompt caching](#does-this-reduce-token-cost-how-do-i-get-prompt-caching-to-actually-hit)
@@ -19,6 +20,7 @@
 - [How it works](#how-it-works)
   - [How does the context in LLM386 get exposed to the LLM model?](#how-does-the-context-in-llm386-get-exposed-to-the-llm-model)
 - [Performance and sizing](#performance-and-sizing)
+  - [Should I use LMDB or Postgres for the block store? What am I giving up?](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up)
   - [How much latency does this add to my agent?](#how-much-latency-does-this-add-to-my-agent)
   - [How big can the memory store get?](#how-big-can-the-memory-store-get)
   - [Does the runtime pack only what's needed, or does it fill the model's context window?](#does-the-runtime-pack-only-whats-needed-or-does-it-fill-the-models-context-window)
@@ -182,16 +184,71 @@ Empty sections are omitted. Token totals are reported in the manifest header tha
 
 ## Performance and sizing
 
+### Should I use LMDB or Postgres for the block store? What am I giving up?
+
+**Default to LMDB.** Pick Postgres only when the operational model demands it.
+
+LMDB is a memory-mapped, single-writer, single-host store. Postgres is a network database with multi-writer concurrency, durable transactions across connections, and the operational machinery you probably already run (backups, replicas, pooling, ACLs). The trait surface in `llm386-core` is identical — pager, packer, retrievers, trace store all work with either — so the choice is purely operational.
+
+**Pick LMDB when:**
+
+- The runtime is embedded in a single process (CLI tool, desktop app, a single agent service replica).
+- You want the lowest read latency available. `get` on LMDB is a mmap page lookup, ~2 µs in process. Postgres `get` is ~120 µs over a local Unix socket and grows by network RTT in production.
+- You want to use `llm386 verify` and `llm386 repair`. These walk LMDB internals to recompute hashes and rebuild indexes; Postgres has different (and stronger) integrity primitives so the tools don't port.
+- You don't need cross-process write concurrency. LMDB serializes writers across the whole environment — only one process holds the write lock at a time.
+
+**Pick Postgres when:**
+
+- **Multiple processes need to write.** Pod-replicated services hit LMDB's single-writer lock immediately. Postgres handles concurrent writers natively.
+- **No shared writable filesystem.** Container orchestrators that schedule across nodes have no portable story for a writable LMDB file. NFS/EFS-mounted LMDB is undefined behavior.
+- **You already run Postgres.** Connection pooling, schema migrations, snapshot backups, point-in-time recovery, replication, observability, multi-tenant ACLs — every cloud-native deployment already runs this for its primary database. Reusing it for the LLM context store has no marginal ops cost.
+- **You want native ACID across processes.** A `put` writes the block, the hash-index row, and the session-membership row in a single transaction. Concurrent writers don't see partial state.
+- **You're planning to colocate vector search.** Adding `pgvector` later lets `llm386-retrieve-ann` resolve embeddings against the same table that holds the blocks — schema metadata, conversation turns, tool results, and their embeddings in one table, queried by a single JOIN with an HNSW index. No separate vector database to operate.
+
+**What you give up with Postgres:**
+
+- **Read latency.** `get` is roughly 50× slower than LMDB; `list_session` is roughly 14× slower. Over a real network the absolute floor moves further. For a typical chat turn (~50 blocks selected), this is sub-millisecond → low-single-digit-ms and almost always invisible next to the model API call. For very latency-sensitive single-fact lookups it can matter.
+- **`verify` / `repair`.** The integrity tooling is LMDB-only. The PG backend errors cleanly when you try (`verify is LMDB-only (active backend: pg)`). Use `pg_dump`, foreign-key checks, `REINDEX`, `VACUUM`, and your existing Postgres observability instead.
+- **Embedded simplicity.** With Postgres you now have a database to provision, secure, back up, and version. For a single-host CLI or a desktop app this is overkill.
+
+**What you give up with LMDB:**
+
+- **Cross-process write concurrency.** Process A holding the write lock blocks process B. Within a single process, internal mutexes serialize writers similarly.
+- **A standard backup/replication story.** LMDB has `mdb_copy` for snapshots; there's no built-in PITR or streaming replication. You roll your own.
+- **A shared, network-accessible store.** LMDB is local-disk only.
+
+**Operationally:** the same `Store` API and the same `llm386` binary handle both. Backend is picked by config:
+
+```toml
+# llm386.toml
+[store]
+backend = "lmdb"
+path    = "./store"
+```
+
+or
+
+```toml
+[store]
+backend = "pg"
+url     = "postgres://user@host/db"
+```
+
+CLI overrides: `llm386 --store ./path …` (LMDB) or `llm386 --pg-url postgres://… …` (PG). Python: `Store("./path")` or `Store(url="postgres://…")`.
+
+**Perf table:** the bundled [`llm386-store-bench`](./crates/llm386-store-bench/) hammers both backends with identical workloads. The full numbers — including the LMDB-write caveat and the PG-read socket-floor caveat — are in the [README → Performance section](./README.md#performance).
+
 ### How much latency does this add to my agent?
 
-Specific to your hardware and session size, but here is a baseline from the bundled benchmarks on a 2024 Apple Silicon laptop:
+Specific to your hardware, session size, and chosen backend. Baseline from the bundled benchmarks on a 2024 Apple Silicon laptop:
 
 - Pager: 141 µs for 100 blocks, 1.4 ms for 1000 blocks (linear in N).
 - Tokenizer (cl100k_base): 56 µs for 2.7 KB, 1.2 ms for 45 KB.
-- LMDB put: low single-digit ms.
-- LMDB get: sub-millisecond.
+- Block-store reads/writes — backend-dependent:
+  - **LMDB**: `put` low single-digit ms (WAL fsync-bound); `get` ~2 µs in-process; `list_session` ~100 µs.
+  - **Postgres** (local Unix socket): `put` ~300 µs; `get` ~120 µs; `list_session` ~1.3 ms. Add network RTT for non-local deployments.
 
-For a typical chat-style turn (50 to 100 blocks selected, a few KB of rendered prompt) end-to-end `pack` from the Rust library lands in the 5 to 10 ms range. The model API call itself dominates by orders of magnitude.
+For a typical chat-style turn (50–100 blocks selected, a few KB of rendered prompt) end-to-end `pack` from the Rust library lands in the 5–10 ms range on LMDB and 10–25 ms range on a local Postgres. The model API call itself dominates by orders of magnitude in either case. Full perf table with workload breakdown in the [README → Performance section](./README.md#performance); deeper backend comparison in [Should I use LMDB or Postgres?](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up).
 
 The Python SDK (PyO3 bindings) is in-process and runs at near-native speed. The previous CLI-shelling SDK added 30 to 50 ms per call from process startup; that path is no longer the default.
 
@@ -199,15 +256,19 @@ If you enable a network-backed summarizer (Anthropic) or embedder (OpenAI), thos
 
 ### How big can the memory store get?
 
-The default LMDB `map_size` is 64 GiB. That is a virtual reservation, not an allocation, so the on-disk footprint only grows as you write. Concrete capacity depends on your average block size:
+Capacity is set by the chosen backend, not by LLM386. Rough capacity estimates for both, by average block size:
 
-- Chat-style blocks (~200 bytes each): hundreds of millions of blocks.
-- Document chunks (~2 KB each): tens of millions.
-- Embeddings (1536-dim float32, ~6 KB each): roughly 10 million.
+| block kind                           | ~size      | LMDB at 64 GiB default | Postgres (per TB of DB) |
+|--------------------------------------|------------|------------------------|-------------------------|
+| Chat-style messages                  | ~200 B     | hundreds of millions   | ~5 billion              |
+| Document chunks                      | ~2 KiB     | tens of millions       | ~500 million            |
+| Embedding rows (1536-dim float32)    | ~6 KiB     | ~10 million            | ~170 million            |
 
-If you need more, pass a larger `map_size` to `StoreConfig`. LMDB's hard ceiling is your platform's address space (effectively unbounded on 64-bit hosts).
+**LMDB.** The default `map_size` is 64 GiB. That is a virtual reservation, not an allocation, so the on-disk footprint only grows as you write. If you need more, pass a larger `map_size` to `StoreConfig`. LMDB's hard ceiling is your platform's address space — effectively unbounded on 64-bit hosts. Check size with `du -sh ./store`.
 
-There is no built-in size readout yet. `du -sh ./store` is the easy answer.
+**Postgres.** Capacity is whatever your database can hold; the table layout has no built-in ceiling. Practical limits come from the underlying disk, the instance size, and your VACUUM cadence (the dedup unique index gets some churn on rewrites). Check size with `psql -c "SELECT pg_size_pretty(pg_total_relation_size('llm386_blocks'));"` or the equivalent against the configured schema.
+
+Either backend will outlast most agent workloads before you have to think about capacity. Lifecycle policies (summarization, purge of stale sessions) tend to bite before storage does — see [Is it ever a good idea to purge memory?](#is-it-ever-a-good-idea-to-purge-memory).
 
 ### Does the runtime pack only what's needed, or does it fill the model's context window?
 
@@ -262,20 +323,32 @@ The cache key is the **exact token sequence of the prefix**. A single byte diffe
 
 ### If it gets corrupted, can I rebuild it somehow?
 
-LMDB itself is crash-safe. It uses a B+ tree with copy-on-write writes, so a pulled power cord or a `kill -9` during a transaction leaves the store readable; the in-flight transaction is just rolled back.
+Two layers matter: the storage engine's own crash safety (free), and tooling to detect and fix application-level corruption (different per backend).
 
-Application-level corruption (your own code or a future schema migration writing the wrong bytes) is partially recoverable:
+**Crash safety — both backends are safe.** A pulled power cord or `kill -9` mid-write leaves either store readable and rolls back the in-flight transaction. LMDB uses a copy-on-write B+ tree; Postgres uses its own WAL.
 
-- The schema version stamped in the `meta` table prevents older code from opening a newer-format store.
+**Application-level corruption** (your own code or a future schema migration writing the wrong bytes) is partially recoverable in either case:
+
+- The schema version stamped in `llm386_meta` prevents older code from opening a newer-format store.
 - Each block carries its content hash, so corrupt block bodies are detectable.
-- `blocks_by_hash` and `blocks_by_session` are indexes derived from `blocks_by_id`, so they can in principle be rebuilt from the primary table.
+- The hash and session indexes are derived from the primary blocks table, so they can in principle be rebuilt.
 
-For corruption you can detect and fix yourself, the runtime ships two subcommands:
+**LMDB — built-in repair tooling.** The runtime ships two LMDB-only subcommands:
 
-- `llm386 verify --store ./store` walks every block in the primary table, recomputes its content hash, and checks the hash and session indexes for consistency. Read-only. Returns a non-zero exit code on any inconsistency.
-- `llm386 repair --store ./store --yes` rebuilds derivable state (the hash index) from the primary table and removes orphan session entries that point at missing blocks. Blocks whose stored hash doesn't match their bytes are left in place and reported — those need human review, not silent rewrite.
+- `llm386 --store ./store verify` walks every block in the primary table, recomputes its content hash, and checks the hash and session indexes for consistency. Read-only. Returns a non-zero exit code on any inconsistency.
+- `llm386 --store ./store repair --yes` rebuilds derivable state (the hash index) from the primary table and removes orphan session entries that point at missing blocks. Blocks whose stored hash doesn't match their bytes are left in place and reported — those need human review, not silent rewrite.
 
-Beyond what those tools cover, the honest answer is: keep backups. Copying the store directory while no writer is active is a valid backup.
+Backup: copy the store directory while no writer is active.
+
+**Postgres — use the database's own primitives.** `verify` / `repair` aren't ported because Postgres already has stronger, mature tools that work against any table:
+
+- `REINDEX TABLE llm386_blocks` rebuilds the dedup unique index from the primary table.
+- `VACUUM (VERBOSE, ANALYZE) llm386_blocks` reclaims dead rows and refreshes stats.
+- `pg_dump` for logical backups; physical base backup + archived WAL for point-in-time recovery.
+- A streaming replica gives you a hot standby with sub-second lag.
+- Content-hash mismatches detect the same way (re-hash the body and compare to the `hash` column) but rewriting a row that fails this check needs human judgment, same as with LMDB.
+
+In either case, **keep backups**. Built-in tooling fixes derivable state; nothing recovers from a bad write that the application committed deliberately.
 
 ### Is it ever a good idea to purge memory?
 
@@ -287,7 +360,7 @@ Yes, in three cases:
 
 Don't purge to "save tokens" or "fit the context window". The pager and section budgets already drop what doesn't fit; that's a runtime concern, not a storage concern. For long-running sessions, summarize old turns instead (the COLD-tier behavior in the pager is built for exactly this).
 
-Blocks are immutable by design and the runtime doesn't expose a `delete` API today. Workarounds are covered in the next question.
+Both `delete(block_id)` and `purge_session(session_id)` are first-class on every backend — the next question shows the API and the find-then-remove pattern compliance workflows want.
 
 ### Legal/security asked me to remove customer data. How do I find and remove it?
 
@@ -319,8 +392,8 @@ For larger stores, the same shape works directly against the Rust library and sk
 **Removing the blocks.** Use the `purge` subcommand (or its Python equivalent). Both are destructive and require explicit confirmation:
 
 ```
-llm386 purge --store ./store --block <block-id> --yes
-llm386 purge --store ./store --session <session-id> --yes
+llm386 --store ./store purge --block <block-id> --yes
+llm386 --store ./store purge --session <session-id> --yes
 ```
 
 ```python
@@ -328,7 +401,7 @@ store.delete(block_id)             # returns True if anything was removed
 store.purge_session(session_id)    # returns count of blocks affected
 ```
 
-`delete` removes the block from the primary table, the content-hash index, and every session that referenced it. `purge_session` removes the entire session's references; blocks left orphaned by that (no other session points at them) are then dropped from the primary table and the hash index too. Both operations run in a single LMDB write transaction.
+`delete` removes the block from the primary table, the content-hash index, and every session that referenced it. `purge_session` removes the entire session's references; blocks left orphaned by that (no other session points at them) are then dropped from the primary table and the hash index too. Both operations are transactional — atomic on either backend, so concurrent readers never see a partially-deleted block.
 
 For audit trail, capture `(session, block_id, kind, hash, created_at)` for every hit before you delete, and store that in a separate compliance log. The content hash makes it easy to prove later that a specific block did exist and was removed.
 
@@ -369,7 +442,7 @@ Yes. Every block belongs to a `SessionId` (a 128-bit value), and every read/writ
 
 `list_sessions` enumerates everything in a store. Two sessions in the same store are isolated for retrieval and paging, but share content-hash dedup (identical block bytes are stored once regardless of session).
 
-For stronger isolation between tenants (compliance, key separation, regulatory boundaries), open a separate `LmdbStore` per tenant. Each one is its own LMDB env with its own files.
+For stronger isolation between tenants (compliance, key separation, regulatory boundaries), open a separate store per tenant. On LMDB that's a distinct `LmdbStore` env (its own files on disk). On Postgres that's a distinct database, or a distinct schema within one database (`PgStoreConfig { schema: Some("tenant_42".into()), ... }` — every pooled connection runs `SET search_path` automatically). Either way the runtime sees them as independent stores.
 
 ### A user has many sessions. How does memory span them?
 
@@ -438,20 +511,22 @@ This pattern works at any scope: a global "company-wide instructions" session, a
 
 ### Can multiple agents share the same memory store?
 
-Yes, with two flavors.
+Yes, but *how* depends on the backend — and this is one of the main reasons to choose between them (see [Should I use LMDB or Postgres?](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up)).
 
-**In-process.** Multiple agents in the same Python or Rust process can share a single store cheaply. Open it once, clone the `Arc<LmdbStore>` (or pass the same Python `Store` instance) to every agent. LMDB's MVCC means readers never block each other; writes within one process serialize through an internal mutex. This is the default working assumption.
+**In-process** (either backend). Multiple agents in the same Python or Rust process share a single store cheaply. Open it once, clone the `Arc<_>` (or pass the same Python `Store` instance) to every agent. Within one process, writes serialize through an internal mutex on either backend; readers never block each other.
 
-**Cross-process.** LMDB is designed for multi-process access too. Each process opens its own `LmdbStore` at the same path; committed writes from one are immediately visible to readers in the others. File-level locking serializes writes across processes. The major caveat: this only works on local filesystems with proper mmap semantics. NFS, some networked filesystems, and certain container overlay filesystems don't behave correctly under LMDB's mmap model. POSIX local filesystems (ext4, xfs, APFS) are fine.
+**Cross-process — LMDB.** LMDB supports multi-process access on local filesystems. Each process opens its own `LmdbStore` at the same path; committed writes from one are immediately visible to readers in the others. File-level locking serializes writes across processes — only one process holds the write lock at a time, so heavy concurrent-write workloads bottleneck quickly. The major caveat: this only works on local filesystems with proper mmap semantics. NFS, some networked filesystems, and certain container overlay filesystems don't behave correctly under LMDB's mmap model. POSIX local filesystems (ext4, xfs, APFS) are fine. If your agents run on different hosts, LMDB isn't the right backend.
 
-**Consistency model.** Reads observe a consistent snapshot taken at transaction start: a long read transaction will not see writes that commit after it began, even from other processes. Writes become visible atomically after commit — there is no partial visibility of a multi-key write. Practically: a `pack` call that opens its read transaction at T sees the store as it was at T, regardless of what concurrent writers are doing.
+**Cross-process — Postgres.** Postgres is the right answer for multi-process or multi-host deployments. Every process opens its own `PgStore` against the same database URL; the database handles concurrent reads *and* concurrent writes. ACID transactions span the whole `put` (block + hash index + session membership commit atomically), so concurrent writers never observe partial state. No shared-filesystem requirement, no mmap caveats. Pod-replicated services, multi-host agent fleets, and serverless functions all work.
 
-**Two flavors of "sharing"** are worth distinguishing:
+**Consistency model — both backends.** Reads observe a consistent snapshot, writes become visible atomically after commit, and there is no partial visibility of a multi-key write. The mechanism differs (LMDB MVCC + B+tree snapshots; Postgres MVCC + REPEATABLE READ / SERIALIZABLE) but the observable contract is the same: a `pack` call started at T sees the store as it was at T, regardless of what concurrent writers are doing.
+
+**Two flavors of "sharing"** are worth distinguishing, regardless of backend:
 
 - *Sharing the store, with separate sessions.* Each agent owns one or more `SessionId`s. They never see each other's blocks unless a custom retriever reads across sessions. This is the right pattern for a multi-agent system where each agent has its own memory scope.
 - *Sharing the store, with overlapping sessions.* Multiple agents read and write the same `SessionId`. They see every other agent's blocks. This is the right pattern for a "team of agents working on one problem" topology, with the session as the shared workspace.
 
-For strong isolation between tenants (different customers, regulatory boundaries), use a separate store per tenant rather than a separate session. Each store is its own LMDB env, its own files, its own permission boundary.
+For strong isolation between tenants (different customers, regulatory boundaries), use a separate store per tenant rather than a separate session. On LMDB that's a separate env; on Postgres that's a separate database (or a separate schema within one database via `PgStoreConfig.schema`).
 
 ---
 
@@ -465,7 +540,7 @@ All retriever scores must be normalized to `[0, 1]`. If you mix scoring systems 
 
 Both are options.
 
-**Storing the full document.** LMDB handles binary content fine. For small to medium documents (PDFs of a few MB, transcripts), put them as `document-chunk` blocks. For very large documents, chunk them first into ~512-token pieces.
+**Storing the full document.** Both backends handle binary content fine (LMDB stores raw bytes; Postgres uses `BYTEA`). For small to medium documents (PDFs of a few MB, transcripts), put them as `document-chunk` blocks. For very large documents, chunk them first into ~512-token pieces. On Postgres, individual block bodies above a few MB will be TOAST'd transparently — fine for occasional large blobs, but if you're routinely storing tens of MB per block consider an external blob store with the LLM386 block holding a reference.
 
 **Storing references.** Put a small block whose body is a URL, a file path, or an external content hash. Write a custom `Packer` that resolves those references at render time. Keeps the store small at the cost of resolve-time latency.
 
