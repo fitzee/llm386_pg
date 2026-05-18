@@ -243,11 +243,10 @@ fn profile_and_tokenizer(
     config: &LoadedConfig,
     model_name: &str,
 ) -> Result<(ModelProfile, Arc<dyn Tokenizer>)> {
-    let profile = config
-        .models
-        .get(model_name)
-        .ok_or_else(|| anyhow!("unknown model: {model_name}"))?
-        .clone();
+    // `resolve` is infallible — strips provider prefixes, exact-
+    // matches, then family-fallbacks, then default-fallbacks with a
+    // deduped warning per unknown input.
+    let profile = config.models.resolve(model_name).clone();
     let tokenizer = config.tokenizers.get(&profile.tokenizer).ok_or_else(|| {
         anyhow!(
             "no tokenizer adapter for {} (used by model {})",

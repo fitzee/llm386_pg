@@ -279,9 +279,20 @@ def test_list_models_includes_built_ins():
         assert m.max_context_tokens > 0
 
 
-def test_unknown_model_raises_llm386_error(store):
-    with pytest.raises(LLM386Error):
-        store.page(session=1, model="bogus-model-name", task="x")
+def test_unknown_model_falls_back_without_raising(store):
+    """Unknown model names resolve to the default fallback (currently
+    `gpt-4o`) instead of raising. Pins the data-driven registry
+    contract from `crates/llm386-core/data/models.toml`. See also the
+    Rust resolver tests in `crates/llm386-core/src/model.rs`."""
+    store.put(session=1, kind="fact", body="something")
+    # Bare unknown name → default fallback.
+    store.page(session=1, model="bogus-model-name", task="x")
+    # Provider-prefixed unknown name → same default fallback.
+    store.page(session=1, model="openrouter/google/gemini-2.5", task="x")
+    # Provider-prefixed *known* name → exact match via prefix strip.
+    store.page(session=1, model="anthropic/claude-sonnet-4-6", task="x")
+    # Unknown version within a known family → family fallback.
+    store.page(session=1, model="anthropic/claude-sonnet-4-9", task="x")
 
 
 def test_show_unknown_block_raises_llm386_error(store):

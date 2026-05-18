@@ -1,0 +1,142 @@
+# Built-in model registry.
+#
+# This file ships with the `llm386-core` crate (via `include_str!`)
+# and is parsed at startup by `default_profiles()`. Add a model by
+# appending an entry; rebuild and the resolver will pick it up. No
+# code changes required.
+#
+# Fields:
+#   name                    — canonical id used for exact-match lookup.
+#   family                  — prefix string used for fallback when the
+#                             input doesn't exact-match any known name.
+#                             Resolve picks the longest matching family
+#                             prefix; among ties, the last entry in
+#                             this file wins (so order entries newest
+#                             first if you care about "latest in
+#                             family" semantics).
+#   max_context_tokens      — provider-quoted total context window.
+#   reserved_output_tokens  — kept aside for the model's response.
+#   safety_margin_tokens    — extra cushion to absorb tokenizer
+#                             approximation error and provider
+#                             accounting drift.
+#   tokenizer               — registered TokenizerId. Anthropic
+#                             profiles use `cl100k_base` as an
+#                             approximation; the bumped safety margin
+#                             absorbs the count drift vs Claude's
+#                             real (non-public) tokenizer.
+#   supports_system_role    — does the chat API accept a `system` role?
+#   supports_tools          — does the model support function/tool
+#                             calling?
+#
+# The `default` field at the top names the model used as the final
+# fallback when nothing else resolves. Pick a model with a widely-
+# applicable tokenizer (gpt-4o's o200k_base is currently the safest
+# choice for unknown OpenAI-compatible / OpenRouter-style names).
+
+default = "gpt-4o"
+
+# OpenAI ----------------------------------------------------------------
+
+[[model]]
+name = "gpt-4.1"
+family = "gpt-4.1"
+max_context_tokens = 1_048_576
+reserved_output_tokens = 32_768
+safety_margin_tokens = 256
+tokenizer = "o200k_base"
+supports_system_role = true
+supports_tools = true
+
+[[model]]
+name = "gpt-4o"
+family = "gpt-4o"
+max_context_tokens = 128_000
+reserved_output_tokens = 16_384
+safety_margin_tokens = 256
+tokenizer = "o200k_base"
+supports_system_role = true
+supports_tools = true
+
+[[model]]
+name = "gpt-4o-mini"
+family = "gpt-4o-mini"
+max_context_tokens = 128_000
+reserved_output_tokens = 16_384
+safety_margin_tokens = 256
+tokenizer = "o200k_base"
+supports_system_role = true
+supports_tools = true
+
+[[model]]
+name = "o1"
+family = "o1"
+max_context_tokens = 200_000
+reserved_output_tokens = 100_000
+safety_margin_tokens = 256
+tokenizer = "o200k_base"
+supports_system_role = false
+supports_tools = true
+
+[[model]]
+name = "o3"
+family = "o3"
+max_context_tokens = 200_000
+reserved_output_tokens = 100_000
+safety_margin_tokens = 256
+tokenizer = "o200k_base"
+supports_system_role = true
+supports_tools = true
+
+# Anthropic — cl100k_base is an approximation; bumped margin --------------
+
+[[model]]
+name = "claude-opus-4-7"
+family = "claude-opus"
+max_context_tokens = 200_000
+reserved_output_tokens = 8_192
+safety_margin_tokens = 4_096
+tokenizer = "cl100k_base"
+supports_system_role = true
+supports_tools = true
+
+[[model]]
+name = "claude-sonnet-4-6"
+family = "claude-sonnet"
+max_context_tokens = 200_000
+reserved_output_tokens = 8_192
+safety_margin_tokens = 4_096
+tokenizer = "cl100k_base"
+supports_system_role = true
+supports_tools = true
+
+[[model]]
+name = "claude-haiku-4-5"
+family = "claude-haiku"
+max_context_tokens = 200_000
+reserved_output_tokens = 8_192
+safety_margin_tokens = 4_096
+tokenizer = "cl100k_base"
+supports_system_role = true
+supports_tools = true
+
+# Llama / Qwen — tokenizer adapters not yet shipped -----------------------
+
+[[model]]
+name = "llama-3.1-70b"
+family = "llama-3"
+max_context_tokens = 128_000
+reserved_output_tokens = 4_096
+safety_margin_tokens = 512
+tokenizer = "llama-3"
+supports_system_role = true
+supports_tools = true
+
+[[model]]
+name = "qwen-2.5-72b"
+family = "qwen-2.5"
+max_context_tokens = 128_000
+reserved_output_tokens = 4_096
+safety_margin_tokens = 512
+tokenizer = "qwen-2.5"
+supports_system_role = true
+supports_tools = true

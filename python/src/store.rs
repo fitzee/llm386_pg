@@ -441,11 +441,11 @@ impl Store {
         &self,
         model_name: &str,
     ) -> PyResult<(llm386_core::ModelProfile, Arc<dyn Tokenizer>)> {
-        let profile = self
-            .models
-            .get(model_name)
-            .ok_or_else(|| LLM386Error::new_err(format!("unknown model: {model_name}")))?
-            .clone();
+        // `resolve` is infallible: strips provider prefixes, exact-
+        // matches, then family-fallbacks, then default-fallbacks.
+        // Emits a deduped warning per unknown input so operators can
+        // see when llm386 is guessing.
+        let profile = self.models.resolve(model_name).clone();
         let tokenizer = self.tokenizers.get(&profile.tokenizer).ok_or_else(|| {
             LLM386Error::new_err(format!(
                 "no tokenizer adapter for {} (used by model {})",

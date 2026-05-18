@@ -15,3 +15,6 @@ workspace = true
 thiserror = { workspace = true }
 serde = { workspace = true }
 blake3 = { workspace = true }
+toml = "1"
+tracing = { workspace = true }
+parking_lot = { workspace = true }

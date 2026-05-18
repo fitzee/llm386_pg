@@ -1401,8 +1401,11 @@ name = "llm386-core"
 version = "1.0.0-alpha"
 dependencies = [
  "blake3",
+ "parking_lot",
  "serde",
  "thiserror",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
