@@ -406,6 +406,7 @@ impl AsyncPgStore {
         let session_b = session_bytes(session);
         let session_slice: &[u8] = session_b.as_slice();
 
+        // Step 1: collect every block id this session references.
         let rows = tx
             .query(
                 "SELECT block_id FROM llm386_session_blocks WHERE session_id = $1",
@@ -428,6 +429,43 @@ impl AsyncPgStore {
             return Ok(0);
         }
 
+        let id_byte_bufs: Vec<Vec<u8>> = block_ids
+            .iter()
+            .map(|id| id_bytes(*id).to_vec())
+            .collect();
+        let id_slices: Vec<&[u8]> = id_byte_bufs.iter().map(Vec::as_slice).collect();
+
+        // Step 2: lock every block row we might delete. Matches the
+        // lock order in `put` (blocks → session_blocks) and `delete`,
+        // so concurrent put + purge + delete can't deadlock. Also
+        // forces any concurrent `put` that dedups to one of these
+        // blocks to block at its `DO UPDATE` until purge commits —
+        // closing the orphan-check race where put's session_blocks
+        // insert could commit between purge's check and purge's
+        // block delete. See `PgStore::purge_session` for the long
+        // rationale.
+        tx.execute(
+            "SELECT 1 FROM llm386_blocks WHERE id = ANY($1) FOR UPDATE",
+            &[&id_slices],
+        )
+        .await
+        .map_err(|e| StoreError::Backend(format!("lock blocks: {e}")))?;
+
+        // Step 3: lock every session_blocks row that references any
+        // of these block ids. Without this, two concurrent
+        // purge_session calls on shared blocks would both see each
+        // other's uncommitted deletes as "still alive" in their
+        // orphan checks, skip the block delete, and leak the block.
+        tx.execute(
+            "SELECT 1 FROM llm386_session_blocks
+             WHERE block_id = ANY($1)
+             FOR UPDATE",
+            &[&id_slices],
+        )
+        .await
+        .map_err(|e| StoreError::Backend(format!("lock session refs: {e}")))?;
+
+        // Step 4: drop this session's references.
         tx.execute(
             "DELETE FROM llm386_session_blocks WHERE session_id = $1",
             &[&session_slice],
@@ -435,28 +473,47 @@ impl AsyncPgStore {
         .await
         .map_err(|e| StoreError::Backend(format!("delete session refs: {e}")))?;
 
-        for id in &block_ids {
-            let id_b = id_bytes(*id);
-            let id_slice: &[u8] = id_b.as_slice();
-            let still_referenced: bool = tx
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM llm386_session_blocks WHERE block_id = $1)",
-                    &[&id_slice],
-                )
-                .await
-                .map_err(|e| StoreError::Backend(format!("orphan check: {e}")))?
-                .get(0);
-            if !still_referenced {
-                tx.execute(
-                    "DELETE FROM llm386_edges WHERE from_id = $1 OR to_id = $1",
-                    &[&id_slice],
-                )
-                .await
-                .map_err(|e| StoreError::Backend(format!("delete orphan edges: {e}")))?;
-                tx.execute("DELETE FROM llm386_blocks WHERE id = $1", &[&id_slice])
-                    .await
-                    .map_err(|e| StoreError::Backend(format!("delete orphan block: {e}")))?;
-            }
+        // Step 5: find which of those blocks are now orphans in a
+        // single query (vs. the per-id N+1 round-trips this used to
+        // do).
+        let orphan_rows = tx
+            .query(
+                "SELECT id FROM llm386_blocks
+                 WHERE id = ANY($1)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM llm386_session_blocks sb
+                     WHERE sb.block_id = llm386_blocks.id
+                   )",
+                &[&id_slices],
+            )
+            .await
+            .map_err(|e| StoreError::Backend(format!("collect orphans: {e}")))?;
+        let orphan_byte_bufs: Vec<Vec<u8>> = orphan_rows
+            .iter()
+            .map(|r| {
+                let b: &[u8] = r.get(0);
+                b.to_vec()
+            })
+            .collect();
+
+        // Step 6: scrub edges + blocks for the orphan set in two
+        // statements, regardless of how many orphans there are.
+        if !orphan_byte_bufs.is_empty() {
+            let orphan_slices: Vec<&[u8]> =
+                orphan_byte_bufs.iter().map(Vec::as_slice).collect();
+            tx.execute(
+                "DELETE FROM llm386_edges
+                 WHERE from_id = ANY($1) OR to_id = ANY($1)",
+                &[&orphan_slices],
+            )
+            .await
+            .map_err(|e| StoreError::Backend(format!("delete orphan edges: {e}")))?;
+            tx.execute(
+                "DELETE FROM llm386_blocks WHERE id = ANY($1)",
+                &[&orphan_slices],
+            )
+            .await
+            .map_err(|e| StoreError::Backend(format!("delete orphan blocks: {e}")))?;
         }
 
         tx.commit()

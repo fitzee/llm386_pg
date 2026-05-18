@@ -357,7 +357,32 @@ impl BlockStore for PgStore {
                 .collect();
             let id_slices: Vec<&[u8]> = id_byte_bufs.iter().map(Vec::as_slice).collect();
 
-            // Step 2: lock every session_blocks row that references any
+            // Step 2: lock every block row we might delete BEFORE the
+            // orphan-check work. Two reasons:
+            //   1. A concurrent `put` that dedups to one of these
+            //      blocks does `INSERT ... ON CONFLICT (hash) DO
+            //      UPDATE` which takes a row lock on `llm386_blocks.id`
+            //      first, then inserts into `llm386_session_blocks`.
+            //      If purge took the session_blocks lock first, its
+            //      orphan check would run before the put's session_blocks
+            //      insert was visible, conclude the block was orphan,
+            //      and delete it — *after* the put's INSERT committed.
+            //      That leaves a dangling `session_blocks` row pointing
+            //      at a deleted block. Taking the blocks lock first
+            //      makes the put block at its `DO UPDATE`, so the put
+            //      can't insert into session_blocks until purge commits
+            //      (and put either dedups to the kept block or inserts
+            //      a fresh one).
+            //   2. The lock order matches `put` (blocks → session_blocks)
+            //      and `delete` (blocks → session_blocks) so the three
+            //      operations can't deadlock on the same block.
+            tx.execute(
+                "SELECT 1 FROM llm386_blocks WHERE id = ANY($1) FOR UPDATE",
+                &[&id_slices],
+            )
+            .map_err(|e| StoreError::Backend(format!("lock blocks: {e}")))?;
+
+            // Step 3: lock every session_blocks row that references any
             // of these block ids — including rows for OTHER sessions
             // sharing the block. This is the fix for the orphan-leak race
             // a naive READ COMMITTED implementation has: without this
@@ -375,14 +400,14 @@ impl BlockStore for PgStore {
             )
             .map_err(|e| StoreError::Backend(format!("lock session refs: {e}")))?;
 
-            // Step 3: drop this session's references.
+            // Step 4: drop this session's references.
             tx.execute(
                 "DELETE FROM llm386_session_blocks WHERE session_id = $1",
                 &[&session_slice],
             )
             .map_err(|e| StoreError::Backend(format!("delete session refs: {e}")))?;
 
-            // Step 4: find which of those blocks are now orphans. Done in
+            // Step 5: find which of those blocks are now orphans. Done in
             // one query rather than N+1 separate EXISTS round-trips.
             let orphan_rows = tx
                 .query(
@@ -403,7 +428,7 @@ impl BlockStore for PgStore {
                 })
                 .collect();
 
-            // Step 5: scrub edges + blocks for the orphan set in two
+            // Step 6: scrub edges + blocks for the orphan set in two
             // statements, regardless of how many orphans there are.
             if !orphan_byte_bufs.is_empty() {
                 let orphan_slices: Vec<&[u8]> =
