@@ -120,34 +120,35 @@ impl BlockStore for PgStore {
             &hash_bytes.as_slice(),
         ];
 
-        let rows = tx
-            .query(
+        // Single-statement UPSERT: on conflict, lock the existing
+        // row and return its id; on no conflict, insert and return
+        // the new id. Using DO UPDATE (with a no-op SET that doesn't
+        // change any observable field) acquires the conflict row's
+        // lock atomically with the conflict detection, which closes
+        // the TOCTOU window a separate fallback SELECT would leave
+        // open under READ COMMITTED — a concurrent committed delete
+        // can't vaporize the row between conflict detection and the
+        // SELECT. The `SET hash = llm386_blocks.hash` is a no-op
+        // value-wise (matches LMDB's "dedup does not mutate the
+        // existing block" contract) but still causes Postgres to lock
+        // the row and emit RETURNING, which is what we need.
+        let row = tx
+            .query_one(
                 "INSERT INTO llm386_blocks
                     (id, kind, bytes, token_counts, priority,
                      created_at, updated_at, provenance, hash)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (hash) DO NOTHING
+                 ON CONFLICT (hash) DO UPDATE SET hash = llm386_blocks.hash
                  RETURNING id",
                 params,
             )
             .map_err(|e| StoreError::Backend(format!("insert block: {e}")))?;
-
-        let stored_id = if let Some(row) = rows.first() {
+        let stored_id = {
             let bytes: &[u8] = row.get(0);
-            decode_block_id(bytes)?
-        } else {
-            let lookup = tx
-                .query_opt(
-                    "SELECT id FROM llm386_blocks WHERE hash = $1",
-                    &[&hash_bytes.as_slice()],
-                )
-                .map_err(|e| StoreError::Backend(format!("lookup hash: {e}")))?
-                .ok_or_else(|| {
-                    StoreError::Backend("dedup conflict but hash row missing".into())
-                })?;
-            let bytes: &[u8] = lookup.get(0);
             let id = decode_block_id(bytes)?;
-            debug!(?id, "deduped on content hash");
+            if id != block.id {
+                debug!(?id, "deduped on content hash");
+            }
             id
         };
 
@@ -242,6 +243,19 @@ impl BlockStore for PgStore {
         let id_b = id_bytes(id);
         let id_slice: &[u8] = id_b.as_slice();
 
+        // Lock order matters: `put`'s ON CONFLICT DO UPDATE takes a
+        // row lock on `llm386_blocks.id` *before* it inserts into
+        // `llm386_session_blocks`. Delete must acquire the same row
+        // lock first so concurrent put + delete on the same block
+        // can't deadlock (delete-then-blocks would otherwise hold
+        // session_blocks rows while waiting on blocks.id, while put
+        // holds blocks.id and waits to write session_blocks).
+        let block_deleted = tx
+            .execute(
+                "DELETE FROM llm386_blocks WHERE id = $1",
+                &[&id_slice],
+            )
+            .map_err(|e| StoreError::Backend(format!("delete block: {e}")))?;
         let sessions_deleted = tx
             .execute(
                 "DELETE FROM llm386_session_blocks WHERE block_id = $1",
@@ -253,12 +267,6 @@ impl BlockStore for PgStore {
             &[&id_slice],
         )
         .map_err(|e| StoreError::Backend(format!("delete edges: {e}")))?;
-        let block_deleted = tx
-            .execute(
-                "DELETE FROM llm386_blocks WHERE id = $1",
-                &[&id_slice],
-            )
-            .map_err(|e| StoreError::Backend(format!("delete block: {e}")))?;
 
         tx.commit()
             .map_err(|e| StoreError::Backend(format!("commit: {e}")))?;

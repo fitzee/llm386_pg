@@ -202,36 +202,29 @@ impl AsyncPgStore {
             &hash_bytes.as_slice(),
         ];
 
-        let rows = tx
-            .query(
+        // Single-statement UPSERT — see `PgStore::put` for the
+        // detailed rationale. Closes the TOCTOU window between the
+        // failed INSERT and a fallback SELECT under READ COMMITTED;
+        // the no-op `SET hash = llm386_blocks.hash` acquires the
+        // conflict row's lock without observable side effect.
+        let row = tx
+            .query_one(
                 "INSERT INTO llm386_blocks
                     (id, kind, bytes, token_counts, priority,
                      created_at, updated_at, provenance, hash)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (hash) DO NOTHING
+                 ON CONFLICT (hash) DO UPDATE SET hash = llm386_blocks.hash
                  RETURNING id",
                 params,
             )
             .await
             .map_err(|e| StoreError::Backend(format!("insert block: {}", format_pg_err(&e))))?;
-
-        let stored_id = if let Some(row) = rows.first() {
+        let stored_id = {
             let bytes: &[u8] = row.get(0);
-            decode_block_id(bytes)?
-        } else {
-            let lookup = tx
-                .query_opt(
-                    "SELECT id FROM llm386_blocks WHERE hash = $1",
-                    &[&hash_bytes.as_slice()],
-                )
-                .await
-                .map_err(|e| StoreError::Backend(format!("lookup hash: {e}")))?
-                .ok_or_else(|| {
-                    StoreError::Backend("dedup conflict but hash row missing".into())
-                })?;
-            let bytes: &[u8] = lookup.get(0);
             let id = decode_block_id(bytes)?;
-            debug!(?id, "deduped on content hash");
+            if id != block.id {
+                debug!(?id, "deduped on content hash");
+            }
             id
         };
 
@@ -333,6 +326,15 @@ impl AsyncPgStore {
         let id_b = id_bytes(id);
         let id_slice: &[u8] = id_b.as_slice();
 
+        // Lock order matters — see the matching comment in
+        // [`crate::PgStore::delete`]. `put`'s ON CONFLICT DO UPDATE
+        // takes a row lock on `llm386_blocks.id` before writing
+        // `llm386_session_blocks`; delete must do the same to avoid
+        // deadlocking with concurrent puts.
+        let block_deleted = tx
+            .execute("DELETE FROM llm386_blocks WHERE id = $1", &[&id_slice])
+            .await
+            .map_err(|e| StoreError::Backend(format!("delete block: {e}")))?;
         let sessions_deleted = tx
             .execute(
                 "DELETE FROM llm386_session_blocks WHERE block_id = $1",
@@ -346,10 +348,6 @@ impl AsyncPgStore {
         )
         .await
         .map_err(|e| StoreError::Backend(format!("delete edges: {e}")))?;
-        let block_deleted = tx
-            .execute("DELETE FROM llm386_blocks WHERE id = $1", &[&id_slice])
-            .await
-            .map_err(|e| StoreError::Backend(format!("delete block: {e}")))?;
 
         tx.commit()
             .await

@@ -1467,6 +1467,7 @@ version = "1.0.0-alpha"
 dependencies = [
  "deadpool-postgres",
  "llm386-core",
+ "parking_lot",
  "postgres",
  "proptest",
  "r2d2",
