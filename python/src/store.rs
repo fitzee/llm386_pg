@@ -34,7 +34,10 @@ create_exception!(llm386, LLM386Error, PyException);
 
 #[pyclass]
 pub struct Store {
-    inner: StoreBackend,
+    // `inner` is `None` after [`Store::close`] has been called. Methods
+    // that need the backend use [`Store::ensure_open`] to fail loudly
+    // instead of acting on a closed store.
+    inner: Option<StoreBackend>,
     tokenizers: TokenizerRegistry,
     models: ModelRegistry,
     retriever_entries: Vec<config::RetrieverEntry>,
@@ -90,7 +93,7 @@ impl Store {
 
         let inner = open_backend(store_entry, path, url).map_err(LLM386Error::new_err)?;
         Ok(Self {
-            inner,
+            inner: Some(inner),
             tokenizers,
             models,
             retriever_entries,
@@ -98,6 +101,33 @@ impl Store {
             packer_options,
             python_retrievers: RwLock::new(Vec::new()),
         })
+    }
+
+    /// Release the store's resources (Postgres connection pool, LMDB
+    /// environment handle) eagerly instead of waiting for Python GC.
+    ///
+    /// After ``close()`` returns, the [`Store`] is unusable: every
+    /// subsequent method (``put``, ``page``, ``pack``, ``add_edge``,
+    /// etc.) raises ``LLM386Error: store is closed``. Calling
+    /// ``close()`` again is a no-op — it's safe to invoke from cleanup
+    /// paths that may run more than once.
+    ///
+    /// Typical use: long-running services that cache a Store per
+    /// workspace and want to evict entries (LRU, workspace deletion)
+    /// without holding the pool open until the process restarts.
+    /// Without an explicit ``close``, the pool only releases when the
+    /// last Python reference drops and Rust's ``Drop`` impl fires —
+    /// works in CPython but is operationally fragile.
+    fn close(&mut self) {
+        // Dropping the `StoreBackend` here drops the inner Arc; if no
+        // other clones exist (and they shouldn't, the dispatch macro
+        // only borrows) the PgStore's r2d2 pool / LmdbStore's env
+        // handle releases at this point.
+        self.inner.take();
+        // Drop registered Python retrievers too — they hold their own
+        // resources (vector-DB engines, OpenAI clients) keyed off this
+        // store's lifecycle.
+        self.python_retrievers.write().clear();
     }
 
     /// Register a Python object as a retriever. The object must
@@ -149,7 +179,7 @@ impl Store {
             provenance: Provenance::default(),
             hash: ContentHash::of(&bytes),
         };
-        let stored = dispatch!(&self.inner, |s| s.put(session, block))
+        let stored = dispatch!(self.ensure_open()?, |s| s.put(session, block))
             .map_err(|e| LLM386Error::new_err(format!("put: {e}")))?;
         Ok(format!("{stored}"))
     }
@@ -157,7 +187,7 @@ impl Store {
     /// Fetch a block by id (32-char hex string).
     fn show(&self, block_id: &str) -> PyResult<ContextBlock> {
         let id = parse_block_id(block_id)?;
-        let block = dispatch!(&self.inner, |s| s.get(id))
+        let block = dispatch!(self.ensure_open()?, |s| s.get(id))
             .map_err(|e| LLM386Error::new_err(format!("get: {e}")))?
             .ok_or_else(|| LLM386Error::new_err(format!("block not found: {block_id}")))?;
         Ok(ContextBlock::from_rust(block))
@@ -165,7 +195,7 @@ impl Store {
 
     /// Every distinct session id with at least one block.
     fn list_sessions(&self) -> PyResult<Vec<String>> {
-        let sessions = dispatch!(&self.inner, |s| s.list_sessions())
+        let sessions = dispatch!(self.ensure_open()?, |s| s.list_sessions())
             .map_err(|e| LLM386Error::new_err(format!("list_sessions: {e}")))?;
         Ok(sessions.into_iter().map(|s| format!("{s}")).collect())
     }
@@ -175,7 +205,7 @@ impl Store {
     /// Returns True if the block existed.
     fn delete(&self, block_id: &str) -> PyResult<bool> {
         let id = parse_block_id(block_id)?;
-        dispatch!(&self.inner, |s| s.delete(id))
+        dispatch!(self.ensure_open()?, |s| s.delete(id))
             .map_err(|e| LLM386Error::new_err(format!("delete: {e}")))
     }
 
@@ -184,7 +214,7 @@ impl Store {
     /// sessions are kept; ones with no remaining references are
     /// removed entirely (including from the content-hash index).
     fn purge_session(&self, session: u128) -> PyResult<usize> {
-        dispatch!(&self.inner, |s| s.purge_session(SessionId(session)))
+        dispatch!(self.ensure_open()?, |s| s.purge_session(SessionId(session)))
             .map_err(|e| LLM386Error::new_err(format!("purge_session: {e}")))
     }
 
@@ -198,7 +228,7 @@ impl Store {
             to: parse_block_id(to_id)?,
             kind: parse_edge_kind(kind)?,
         };
-        dispatch!(&self.inner, |s| s.put_edge(edge))
+        dispatch!(self.ensure_open()?, |s| s.put_edge(edge))
             .map_err(|e| LLM386Error::new_err(format!("put_edge: {e}")))
     }
 
@@ -206,7 +236,7 @@ impl Store {
     /// kind)` tuples.
     fn edges_from(&self, block_id: &str) -> PyResult<Vec<(String, String)>> {
         let id = parse_block_id(block_id)?;
-        let edges = dispatch!(&self.inner, |s| s.edges_from(id))
+        let edges = dispatch!(self.ensure_open()?, |s| s.edges_from(id))
             .map_err(|e| LLM386Error::new_err(format!("edges_from: {e}")))?;
         Ok(edges
             .into_iter()
@@ -218,7 +248,7 @@ impl Store {
     /// kind)` tuples.
     fn edges_to(&self, block_id: &str) -> PyResult<Vec<(String, String)>> {
         let id = parse_block_id(block_id)?;
-        let edges = dispatch!(&self.inner, |s| s.edges_to(id))
+        let edges = dispatch!(self.ensure_open()?, |s| s.edges_to(id))
             .map_err(|e| LLM386Error::new_err(format!("edges_to: {e}")))?;
         Ok(edges
             .into_iter()
@@ -229,7 +259,7 @@ impl Store {
     /// Run the pager and return the resulting plan.
     fn page(&self, session: u128, model: &str, task: &str) -> PyResult<PagePlan> {
         let (profile, tokenizer) = self.profile_and_tokenizer(model)?;
-        dispatch!(&self.inner, |s| self.page_with(s.clone(), profile, tokenizer, session, task))
+        dispatch!(self.ensure_open()?, |s| self.page_with(s.clone(), profile, tokenizer, session, task))
     }
 
     /// Run page+pack and return either a rendered prompt or a list
@@ -250,7 +280,7 @@ impl Store {
         trace: Option<PathBuf>,
     ) -> PyResult<PackResult> {
         let (profile, tokenizer) = self.profile_and_tokenizer(model)?;
-        dispatch!(&self.inner, |s| self.pack_with(
+        dispatch!(self.ensure_open()?, |s| self.pack_with(
             s.clone(),
             profile,
             tokenizer,
@@ -319,7 +349,7 @@ impl Store {
 
         let started_at = Timestamp(now_ms());
         let started = Instant::now();
-        dispatch!(&self.inner, |s| self.render(
+        dispatch!(self.ensure_open()?, |s| self.render(
             s.clone(),
             request.clone(),
             rust_plan.clone(),
@@ -355,7 +385,7 @@ impl Store {
         anthropic_max_tokens: Option<u32>,
     ) -> PyResult<String> {
         let session = SessionId(session);
-        let mut ids = dispatch!(&self.inner, |s| s.list_session(session))
+        let mut ids = dispatch!(self.ensure_open()?, |s| s.list_session(session))
             .map_err(|e| LLM386Error::new_err(format!("list_session: {e}")))?;
         ids.sort();
         if let Some(n) = last {
@@ -364,7 +394,7 @@ impl Store {
         }
         let mut blocks: Vec<RustBlock> = Vec::with_capacity(ids.len());
         for &id in &ids {
-            if let Some(b) = dispatch!(&self.inner, |s| s.get(id))
+            if let Some(b) = dispatch!(self.ensure_open()?, |s| s.get(id))
                 .map_err(|e| LLM386Error::new_err(format!("get: {e}")))?
             {
                 blocks.push(b);
@@ -429,7 +459,7 @@ impl Store {
                 },
                 hash: ContentHash::of(&bytes),
             };
-            dispatch!(&self.inner, |s| s.put(session, block))
+            dispatch!(self.ensure_open()?, |s| s.put(session, block))
                 .map_err(|e| LLM386Error::new_err(format!("store summary: {e}")))?;
         }
         Ok(text)
@@ -437,6 +467,16 @@ impl Store {
 }
 
 impl Store {
+    /// Return a borrow of the backend or a Python-visible error if
+    /// [`Store::close`] has been called. Every method that accesses
+    /// the backend goes through this so closed-store usage fails
+    /// loudly instead of panicking on `unwrap`.
+    fn ensure_open(&self) -> PyResult<&StoreBackend> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| LLM386Error::new_err("store is closed"))
+    }
+
     fn profile_and_tokenizer(
         &self,
         model_name: &str,
