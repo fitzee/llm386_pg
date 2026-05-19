@@ -47,7 +47,7 @@ LLM386 is the runtime under that surface. The pieces:
 
 - A persistent block store (LMDB-backed) that holds every input the model has seen or might see, keyed and deduplicated by content hash.
 - A typed-edge graph between blocks (`Parent`, `DerivedFrom`, `Supports`, `Contradicts`, `ToolInvocation`) that the pager can follow when assembling a working set, so dependent blocks travel together.
-- A model registry that knows context windows, output reservations, tokenizers, and capability flags per model.
+- A model registry that knows context windows, output reservations, tokenizers, and capability flags per model. Caller-supplied names are resolved tolerantly: `anthropic/claude-sonnet-4-6` is stripped to `claude-sonnet-4-6` for exact match, `claude-sonnet-4-9` family-resolves to the latest registered `claude-sonnet-*`, and anything genuinely unknown falls back to a default (`gpt-4o`) with a deduped warning. The registry is data-driven via [`crates/llm386-core/data/models.toml`](./crates/llm386-core/data/models.toml) — full behavior in the [FAQ](./FAQ.md#what-happens-if-i-pass-a-model-name-llm386-doesnt-know-anthropicclaude-sonnet-45-openrouter).
 - A pager that picks which blocks fit the current call, applying per-section budgets and pluggable retrievers (recency, lexical, BM25, embedding ANN, pinned ids). Each selection records *why* it was included (`Pinned`, `HighRelevance`, `Recency`, `Dependency`, `GlobalFact`, `ToolResult`).
 - A packer that turns the pager's plan into a deterministic prompt string or a list of role-tagged chat messages. Only the rendered prompt text or chat messages are sent to the model. The model never sees block ids, hashes, provenance, edges, or retrieval scores. Store state ≠ model state.
 - A tracer that records every page+pack call (with model build, tokenizer version, and the patched-in model output) so you can replay, audit, or diff it later.
@@ -485,6 +485,7 @@ path    = "./store"
 
 [[profile]]
 name = "my-tiny"
+family = "my-tiny"          # optional; enables family fallback for "my-tiny-v2" etc.
 max_context_tokens = 4096
 reserved_output_tokens = 1024
 tokenizer = "cl100k_base"

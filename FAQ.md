@@ -3,6 +3,7 @@
 ## Quick index
 
 - What does the model see? → [How it works](#how-it-works)
+- Why is `anthropic/claude-…` working but with a warning? → [Model name resolution](#what-happens-if-i-pass-a-model-name-llm386-doesnt-know-anthropicclaude-sonnet-45-openrouter)
 - LMDB or Postgres? → [Choosing a block-store backend](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up)
 - How fast is it? → [Performance and sizing](#performance-and-sizing)
 - Will it fill the entire context window? → [Does the runtime pack only what's needed?](#does-the-runtime-pack-only-whats-needed-or-does-it-fill-the-models-context-window)
@@ -19,6 +20,7 @@
   - [The README mentions EMM386. What was it, and how is LLM386 similar?](#the-readme-mentions-emm386-what-was-it-and-how-is-llm386-similar)
 - [How it works](#how-it-works)
   - [How does the context in LLM386 get exposed to the LLM model?](#how-does-the-context-in-llm386-get-exposed-to-the-llm-model)
+  - [What happens if I pass a model name LLM386 doesn't know? (`anthropic/claude-sonnet-4.5`, `openrouter/…`)](#what-happens-if-i-pass-a-model-name-llm386-doesnt-know-anthropicclaude-sonnet-45-openrouter)
 - [Performance and sizing](#performance-and-sizing)
   - [Should I use LMDB or Postgres for the block store? What am I giving up?](#should-i-use-lmdb-or-postgres-for-the-block-store-what-am-i-giving-up)
   - [How do I enable TLS to my Postgres?](#how-do-i-enable-tls-to-my-postgres)
@@ -180,6 +182,33 @@ Total tokens: 2413 / 8192
 ```
 
 Empty sections are omitted. Token totals are reported in the manifest header that `llm386 pack` prints to stderr (and on the `PackedPrompt.input_tokens` field programmatically).
+
+### What happens if I pass a model name LLM386 doesn't know? (`anthropic/claude-sonnet-4.5`, `openrouter/…`)
+
+LLM386 ships a built-in registry of model profiles (context window, output reservation, tokenizer, capability flags). It used to hard-error on any name not in that list. As of the data-driven resolver it instead **always returns a profile**, falling through a four-step lookup and emitting a single warning per unknown input so operators can see when the runtime is guessing.
+
+The lookup order — applied uniformly by the CLI, Python SDK, and the Rust library:
+
+1. **Strip provider segments.** `anthropic/claude-sonnet-4-6`, `openrouter/anthropic/claude-3.5-sonnet` → take the substring after the last `/`. This handles OpenRouter-style names, the LiteLLM `provider/model` convention, and anything else with a one-or-more-segment prefix.
+2. **Exact match** against the registered `name`. No warning.
+3. **Family fallback.** Each built-in profile carries a `family` prefix (`claude-sonnet`, `gpt-4o`, `llama-3`, …). If the normalized name starts with one, the *longest* matching family wins, and within a family the *last-registered* entry wins (so newer versions you add later override older ones). Emits a deduped `tracing::warn!`.
+4. **Default fallback.** If nothing matches, return the registry's default model — currently `gpt-4o` (its `o200k_base` tokenizer is the safest "average" for unknown OpenAI-compatible names). Same deduped warning.
+
+Concrete examples against the current built-in set:
+
+| Input                                       | Resolves to        | Warning?           |
+|---------------------------------------------|--------------------|--------------------|
+| `claude-sonnet-4-6`                         | `claude-sonnet-4-6`| no                 |
+| `anthropic/claude-sonnet-4-6`               | `claude-sonnet-4-6`| no (strip + exact) |
+| `openrouter/anthropic/claude-sonnet-4-6`    | `claude-sonnet-4-6`| no                 |
+| `anthropic/claude-sonnet-4-9` (future ver.) | `claude-sonnet-4-6`| yes (family)       |
+| `openrouter/google/gemini-2.5` (unknown)    | `gpt-4o`           | yes (default)      |
+
+**Watching the warnings.** The Rust library emits via `tracing::warn!`. The CLI surfaces them on stderr at the default `RUST_LOG=warn` level. The Python wrapper relies on the host process having a `tracing-subscriber` bridge installed — see the [Python SDK README](./python/README.md) for the snippet.
+
+**Adding a model permanently.** Edit [`crates/llm386-core/data/models.toml`](./crates/llm386-core/data/models.toml) and rebuild. Each entry needs `name`, `family` (optional), `max_context_tokens`, `reserved_output_tokens`, `safety_margin_tokens`, and a registered `tokenizer` id. If the new entry is the freshest in a family, it'll automatically become the family-fallback target for future versions.
+
+**Adding an ad-hoc model at runtime.** Set a `[[profile]]` block in your `--profiles` TOML with a matching `name` (and optionally a `family`). Same shape as the built-in entries; takes precedence over them on name conflict.
 
 ---
 

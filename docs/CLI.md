@@ -207,6 +207,8 @@ List every built-in `ModelProfile`, plus any `[[profile]]` entries you added via
 
 **Use when:** picking a `--model` value for `page` / `pack`, or sanity-checking that a custom profile in your TOML file actually loaded.
 
+**On the `--model` value:** the CLI is permissive — `--model anthropic/claude-sonnet-4-6`, `--model openrouter/anthropic/claude-3.5-sonnet`, and `--model claude-sonnet-4-9` (a hypothetical future version) all resolve. Provider segments are stripped, exact matches win, then family-prefix matches, then a default fallback (currently `gpt-4o`). Fallbacks emit a single `WARN`-level log line per unknown name to stderr — set `RUST_LOG=warn` (default) to see them. Full resolver behavior in the [FAQ](../FAQ.md#what-happens-if-i-pass-a-model-name-llm386-doesnt-know-anthropicclaude-sonnet-45-openrouter).
+
 ---
 
 ## Context assembly

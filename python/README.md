@@ -86,6 +86,32 @@ maturin build --release -F tls-native-tls
 
 Without the feature, `tls = "require"` raises `LLM386Error: TLS mode … requires the tls-native-tls feature` at `Store(...)` time. There is **no silent fall-through to plaintext**. `tls = "require"` also forces `sslmode=require` on the underlying connection, so the postgres client refuses to fall back to plaintext if the server doesn't offer TLS. Full background in the [README → TLS section](../README.md#tls).
 
+## Model names
+
+The `model` kwarg accepts arbitrary strings. Resolution is permissive:
+
+```python
+# Exact match against the built-in registry:
+store.pack(session=1, model="claude-sonnet-4-6", task="...")
+
+# Provider prefix stripped, then exact match:
+store.pack(session=1, model="anthropic/claude-sonnet-4-6", task="...")
+store.pack(session=1, model="openrouter/anthropic/claude-3.5-sonnet", task="...")
+
+# Unknown version → family fallback to the latest registered
+# claude-sonnet-* profile:
+store.pack(session=1, model="anthropic/claude-sonnet-4-9", task="...")
+
+# Genuinely unknown → default fallback (currently gpt-4o, whose
+# o200k_base tokenizer is the safest "average" for unknown
+# OpenAI-compatible names):
+store.pack(session=1, model="openrouter/google/gemini-2.5", task="...")
+```
+
+Fallbacks emit one `tracing::warn!` per unknown input per process lifetime so you can see when the runtime is guessing. Surface these in Python by attaching a tracing-to-log bridge — the simplest is [`pyo3-log`](https://github.com/vorner/pyo3-log) on the host side, or just configure Rust's default subscriber via `RUST_LOG=warn` (warnings go to stderr).
+
+Add a model permanently by editing [`crates/llm386-core/data/models.toml`](../crates/llm386-core/data/models.toml) and rebuilding the extension. For per-call overrides, set a `[[profile]]` block in the `--profiles` TOML; entries there take precedence over the built-ins. Full resolver docs in the [FAQ entry on model name resolution](../FAQ.md#what-happens-if-i-pass-a-model-name-llm386-doesnt-know-anthropicclaude-sonnet-45-openrouter).
+
 ## Using as a memory layer in an agent loop
 
 ```python
@@ -164,6 +190,7 @@ pool_size = 8               # optional, defaults to 8
 
 [[profile]]
 name = "my-tiny"
+family = "my-tiny"          # optional; enables family fallback for "my-tiny-v2" etc.
 max_context_tokens = 4096
 reserved_output_tokens = 1024
 tokenizer = "cl100k_base"
