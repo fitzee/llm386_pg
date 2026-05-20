@@ -1,0 +1,81 @@
+name: Build & publish wheels
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Wheels are abi3 (cp39+) per pyproject.toml's pyo3 features —
+# one wheel per (os, arch) covers all supported CPython versions.
+
+jobs:
+  linux:
+    name: linux-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # manylinux 2_28 covers Debian bookworm (the ss-app base) and
+          # is the current PyPI consensus floor for new Rust extensions.
+          manylinux: '2_28'
+          working-directory: python
+          args: --release --strip --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  macos:
+    name: macos-${{ matrix.target }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          working-directory: python
+          args: --release --strip --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  release:
+    name: Attach wheels to GitHub Release
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: List built wheels
+        run: ls -la dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          # When invoked from workflow_dispatch (no tag), skip release publish.
+          # Tag-triggered runs auto-populate `tag_name` from github.ref.
+          files: dist/*.whl
+          fail_on_unmatched_files: true
