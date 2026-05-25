@@ -33,6 +33,7 @@ jobs:
           manylinux: '2_28'
           working-directory: python
           args: --release --strip --out dist --features tls-native-tls
+          before-script-linux: yum install -y openssl-devel perl-IPC-Cmd
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
