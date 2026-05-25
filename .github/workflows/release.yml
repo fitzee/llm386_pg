@@ -32,7 +32,7 @@ jobs:
           # is the current PyPI consensus floor for new Rust extensions.
           manylinux: '2_28'
           working-directory: python
-          args: --release --strip --out dist
+          args: --release --strip --out dist --features tls-native-tls
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -54,7 +54,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           working-directory: python
-          args: --release --strip --out dist
+          args: --release --strip --out dist --features tls-native-tls
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
