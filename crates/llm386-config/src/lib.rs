@@ -98,6 +98,7 @@ fn parse_tls_mode(
     match tls.map(str::to_ascii_lowercase).as_deref() {
         None | Some("disable") => Ok(TlsMode::Disable),
         Some("require") => Ok(TlsMode::Require),
+        Some("require-noverify") => Ok(TlsMode::RequireNoverify),
         Some("require-custom-ca") => {
             let ca_path = tls_ca_path.ok_or_else(|| {
                 "[store] tls = \"require-custom-ca\" requires `tls_ca_path` \
@@ -109,7 +110,7 @@ fn parse_tls_mode(
             })
         }
         Some(other) => Err(format!(
-            "[store] tls = \"{other}\" — expected one of: disable, require, require-custom-ca",
+            "[store] tls = \"{other}\" — expected one of: disable, require, require-noverify, require-custom-ca",
         )),
     }
 }

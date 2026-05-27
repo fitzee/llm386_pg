@@ -37,6 +37,10 @@ pub enum TlsMode {
     /// root CA store. Works out of the box with most managed Postgres
     /// providers (RDS, Cloud SQL, Supabase, Neon).
     Require,
+    /// Require TLS but skip certificate verification. Matches
+    /// psycopg2/libpq `sslmode=require`: encrypted but no identity
+    /// check. For trusted internal networks (intra-VPC RDS, etc.).
+    RequireNoverify,
     /// Require TLS; verify the server certificate against a custom
     /// PEM-encoded CA bundle. Use this when the server presents a
     /// cert chain rooted at a private CA not in the system store.

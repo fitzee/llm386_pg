@@ -32,6 +32,15 @@ pub(crate) fn build_backend(mode: &TlsMode) -> Result<TlsBackend, StoreOpenError
             Ok(TlsBackend::Native(connector))
         }
         #[cfg(feature = "tls-native-tls")]
+        TlsMode::RequireNoverify => {
+            let connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .map_err(|e| StoreOpenError::TlsConfig(format!("native-tls build: {e}")))?;
+            Ok(TlsBackend::Native(connector))
+        }
+        #[cfg(feature = "tls-native-tls")]
         TlsMode::RequireCustomCa { ca_path } => {
             let pem = std::fs::read(ca_path).map_err(|e| {
                 StoreOpenError::TlsConfig(format!(
