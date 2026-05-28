@@ -20,8 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use llm386_core::BlockKind;
 use llm386_core::{
-    BlockStore, ChatMessage, ChatPrompt, ChatRole, ContextBlock, PackedBlock, PackedPrompt, Packer,
-    PackerError, PagePlan, PageRequest, SectionKind, StoreError, TokenCount, Tokenizer,
+    BlockId, BlockStore, ChatMessage, ChatPrompt, ChatRole, ContextBlock, PackedBlock,
+    PackedPrompt, Packer, PackerError, PagePlan, PageRequest, SectionKind, StoreError, TokenCount,
+    Tokenizer,
 };
 use tracing::instrument;
 
@@ -153,6 +154,8 @@ impl<S: BlockStore + 'static> Packer for SimplePacker<S> {
             blocks.sort_by_key(|b| b.id);
         }
 
+        let notes = collect_notes(plan);
+
         let mut rendered = String::new();
         let mut packed_blocks: Vec<PackedBlock> = Vec::new();
 
@@ -186,6 +189,9 @@ impl<S: BlockStore + 'static> Packer for SimplePacker<S> {
                                 block.id,
                             )))
                         })?;
+                        if let Some(note) = notes.get(&block.id) {
+                            push_note(&mut rendered, note);
+                        }
                         if self.options.include_timestamps {
                             rendered.push('[');
                             rendered.push_str(&format_iso8601_utc(block.created_at.0));
@@ -275,6 +281,7 @@ impl<S: BlockStore + 'static> SimplePacker<S> {
             blocks.sort_by_key(|b| b.id);
         }
 
+        let notes = collect_notes(plan);
         let mut messages: Vec<ChatMessage> = Vec::new();
         let stamps = self.options.include_timestamps;
 
@@ -322,6 +329,9 @@ impl<S: BlockStore + 'static> SimplePacker<S> {
             content.push_str(section_label(section));
             content.push_str("\n\n");
             for block in blocks {
+                if let Some(note) = notes.get(&block.id) {
+                    push_note(&mut content, note);
+                }
                 if stamps {
                     content.push('[');
                     content.push_str(&format_iso8601_utc(block.created_at.0));
@@ -357,11 +367,14 @@ impl<S: BlockStore + 'static> SimplePacker<S> {
                     BlockKind::AssistantMessage => ChatRole::Assistant,
                     _ => ChatRole::User,
                 };
-                let content = if stamps && role != ChatRole::Assistant {
+                let mut content = if stamps && role != ChatRole::Assistant {
                     format!("[{}] {body}", format_iso8601_utc(block.created_at.0))
                 } else {
                     body.into()
                 };
+                if let Some(note) = notes.get(&block.id) {
+                    content = format!("[!] {note}\n{content}");
+                }
                 messages.push(ChatMessage {
                     role,
                     content,
@@ -374,11 +387,14 @@ impl<S: BlockStore + 'static> SimplePacker<S> {
         if let Some(tools) = by_section.get(&SectionKind::Tools) {
             for block in tools {
                 let body = block_text(block)?;
-                let content = if stamps {
+                let mut content = if stamps {
                     format!("[{}] {body}", format_iso8601_utc(block.created_at.0))
                 } else {
                     body.into()
                 };
+                if let Some(note) = notes.get(&block.id) {
+                    content = format!("[!] {note}\n{content}");
+                }
                 messages.push(ChatMessage {
                     role: ChatRole::Tool,
                     content,
@@ -456,6 +472,24 @@ fn format_iso8601_utc(ms_since_epoch: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Map of block id → inline note set by the pager (e.g. an
+/// edge-reconciliation `Contradicts` flag). Empty when the plan
+/// carries no `selections` (the `pack_with_plan` re-render path) or no
+/// block was annotated.
+fn collect_notes(plan: &PagePlan) -> HashMap<BlockId, &str> {
+    plan.selections
+        .iter()
+        .filter_map(|s| s.note.as_deref().map(|n| (s.block_id, n)))
+        .collect()
+}
+
+/// Render an inline note marker on its own line.
+fn push_note(buf: &mut String, note: &str) {
+    buf.push_str("[!] ");
+    buf.push_str(note);
+    buf.push('\n');
+}
+
 fn block_text(block: &ContextBlock) -> Result<&str, PackerError> {
     std::str::from_utf8(&block.bytes).map_err(|e| {
         PackerError::Storage(StoreError::Backend(format!(
@@ -499,11 +533,51 @@ mod tests {
 
     use super::*;
 
-    fn setup() -> (Arc<LmdbStore>, TempDir, Arc<dyn Tokenizer>) {
+    // macOS returns `LMDB: Invalid argument (os error 22)` once too
+    // many LMDB envs are mmap-active at once across the process — a
+    // platform concurrency ceiling, not a logic bug. Cap how many test
+    // stores are live simultaneously. The permit rides on the guard
+    // bound in each test's `_dir` slot, so no test body changes.
+    struct Semaphore {
+        permits: std::sync::Mutex<usize>,
+        avail: std::sync::Condvar,
+    }
+    impl Semaphore {
+        const fn new(n: usize) -> Self {
+            Self {
+                permits: std::sync::Mutex::new(n),
+                avail: std::sync::Condvar::new(),
+            }
+        }
+        fn acquire(&self) {
+            let mut n = self.permits.lock().unwrap();
+            while *n == 0 {
+                n = self.avail.wait(n).unwrap();
+            }
+            *n -= 1;
+        }
+        fn release(&self) {
+            *self.permits.lock().unwrap() += 1;
+            self.avail.notify_one();
+        }
+    }
+    static STORE_SEM: Semaphore = Semaphore::new(6);
+
+    struct TestEnv {
+        _dir: TempDir,
+    }
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            STORE_SEM.release();
+        }
+    }
+
+    fn setup() -> (Arc<LmdbStore>, TestEnv, Arc<dyn Tokenizer>) {
+        STORE_SEM.acquire();
         let dir = TempDir::new().unwrap();
         let store = Arc::new(LmdbStore::open(dir.path(), StoreConfig::default()).unwrap());
         let tok: Arc<dyn Tokenizer> = Arc::new(cl100k_base().unwrap());
-        (store, dir, tok)
+        (store, TestEnv { _dir: dir }, tok)
     }
 
     fn make_block(bytes: &[u8], kind: BlockKind, ts_ms: u64, rnd: u128) -> ContextBlock {
@@ -527,6 +601,7 @@ mod tests {
             reserved_output_tokens: 0,
             safety_margin_tokens: 0,
             tokenizer: TokenizerId::new("cl100k_base"),
+            family: None,
             supports_system_role: true,
             supports_tools: true,
         }

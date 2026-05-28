@@ -19,7 +19,7 @@ use llm386_core::{
 };
 use llm386_config::{StoreBackend, dispatch, open_backend};
 use llm386_packer::SimplePacker;
-use llm386_pager::GreedyPager;
+use llm386_pager::{EdgePolicy, GreedyPager};
 use llm386_tokenizer::{TokenizerRegistry, default_registry as default_tokenizers};
 use llm386_trace::LmdbTraceSink;
 
@@ -43,6 +43,7 @@ pub struct Store {
     retriever_entries: Vec<config::RetrieverEntry>,
     section_budgets: Option<llm386_pager::SectionBudgetTable>,
     packer_options: llm386_packer::PackerOptions,
+    edge_policy: Option<EdgePolicy>,
     python_retrievers: RwLock<Vec<Arc<dyn Retriever>>>,
 }
 
@@ -76,7 +77,7 @@ impl Store {
         let mut tokenizers = default_tokenizers()
             .map_err(|e| LLM386Error::new_err(format!("init tokenizers: {e}")))?;
         let mut models = default_registry();
-        let (retriever_entries, section_budgets, packer_options, store_entry) =
+        let (retriever_entries, section_budgets, packer_options, store_entry, edge_policy) =
             if let Some(cfg_path) = profiles {
                 let parsed = config::parse(&cfg_path).map_err(LLM386Error::new_err)?;
                 let applied = config::apply(parsed, &mut models, &mut tokenizers)
@@ -86,9 +87,16 @@ impl Store {
                     applied.section_budgets,
                     applied.packer_options.unwrap_or_default(),
                     applied.store,
+                    applied.edge_policy,
                 )
             } else {
-                (Vec::new(), None, llm386_packer::PackerOptions::default(), None)
+                (
+                    Vec::new(),
+                    None,
+                    llm386_packer::PackerOptions::default(),
+                    None,
+                    None,
+                )
             };
 
         let inner = open_backend(store_entry, path, url).map_err(LLM386Error::new_err)?;
@@ -99,6 +107,7 @@ impl Store {
             retriever_entries,
             section_budgets,
             packer_options,
+            edge_policy,
             python_retrievers: RwLock::new(Vec::new()),
         })
     }
@@ -514,6 +523,9 @@ impl Store {
         }
         if let Some(budgets) = &self.section_budgets {
             pager = pager.with_budgets(budgets.clone());
+        }
+        if let Some(edge_policy) = self.edge_policy {
+            pager = pager.with_edge_policy(edge_policy);
         }
         Ok(pager)
     }

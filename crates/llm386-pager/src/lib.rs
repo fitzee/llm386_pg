@@ -8,10 +8,14 @@
 #![doc(html_root_url = "https://docs.rs/llm386-pager/1.0.0-alpha")]
 
 mod budget;
+mod edges;
 mod greedy;
 mod retrievers;
 
 pub use budget::{SectionAllocation, SectionBudgetTable};
+pub use edges::{
+    ContradictMode, DerivedMode, EdgePolicy, MAX_DEPTH_CEILING, ParentMode, SupportsMode, ToolMode,
+};
 pub use greedy::{GreedyPager, ScoringPolicy};
 pub use retrievers::{
     Bm25Retriever, LexicalRetriever, PinnedRetriever, RecencyRetriever, SessionRetriever,

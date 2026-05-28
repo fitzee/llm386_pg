@@ -117,14 +117,17 @@ pub struct Selection {
     pub block_id: String,
     pub score: f32,
     pub reason: String,
+    /// Inline annotation set by edge reconciliation (e.g. a
+    /// `Contradicts` flag), or `None`.
+    pub note: Option<String>,
 }
 
 #[pymethods]
 impl Selection {
     fn __repr__(&self) -> String {
         format!(
-            "Selection(block_id={:?}, score={}, reason={:?})",
-            self.block_id, self.score, self.reason,
+            "Selection(block_id={:?}, score={}, reason={:?}, note={:?})",
+            self.block_id, self.score, self.reason, self.note,
         )
     }
 }
@@ -135,6 +138,7 @@ impl Selection {
             block_id: format!("{}", s.block_id),
             score: s.score,
             reason: selection_reason_to_str(s.reason).to_string(),
+            note: s.note,
         }
     }
 }

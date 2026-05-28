@@ -27,7 +27,8 @@ use std::sync::Arc;
 use llm386_core::{BlockStore, ModelProfile, ModelRegistry, Retriever, SectionKind, TokenizerId};
 use llm386_packer::{CacheOptions, PackerOptions};
 use llm386_pager::{
-    Bm25Retriever, LexicalRetriever, RecencyRetriever, SectionBudgetTable, SessionRetriever,
+    Bm25Retriever, ContradictMode, DerivedMode, EdgePolicy, LexicalRetriever, ParentMode,
+    RecencyRetriever, SectionBudgetTable, SessionRetriever, SupportsMode, ToolMode,
 };
 use llm386_store_lmdb::{LmdbStore, StoreConfig};
 use llm386_store_pg::{PgStore, PgStoreConfig, TlsMode};
@@ -54,6 +55,8 @@ pub struct ConfigFile {
     pub cache: Option<CacheEntry>,
     #[serde(default)]
     pub store: Option<StoreEntry>,
+    #[serde(default)]
+    pub edges: Option<EdgeEntry>,
 }
 
 /// `[store]` selects the persistent block-store backend. Optional —
@@ -233,6 +236,110 @@ impl SectionBudgetEntry {
     }
 }
 
+/// `[edges]` — how the pager treats each typed [`EdgeKind`] when
+/// assembling a working set. Every field is optional; omitted fields
+/// keep the [`EdgePolicy::default`] value. Mode strings are kebab-case
+/// (e.g. `parent = "bidirectional"`, `derived_from = "suppress-source"`,
+/// `contradicts = "flag"`). Set `enabled = false` to ignore all edges.
+#[derive(Debug, Default, Deserialize)]
+pub struct EdgeEntry {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub max_depth: Option<u8>,
+    #[serde(default)]
+    pub max_fanout: Option<usize>,
+    #[serde(default)]
+    pub follow_provenance_parents: Option<bool>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub derived_from: Option<String>,
+    #[serde(default)]
+    pub supports: Option<String>,
+    #[serde(default)]
+    pub contradicts: Option<String>,
+    #[serde(default)]
+    pub tool_invocation: Option<String>,
+}
+
+impl EdgeEntry {
+    pub fn build(self) -> Result<EdgePolicy, String> {
+        let mut p = EdgePolicy::default();
+        if let Some(v) = self.enabled {
+            p.enabled = v;
+        }
+        if let Some(v) = self.max_depth {
+            p.max_depth = v;
+        }
+        if let Some(v) = self.max_fanout {
+            p.max_fanout = v;
+        }
+        if let Some(v) = self.follow_provenance_parents {
+            p.follow_provenance_parents = v;
+        }
+        if let Some(s) = self.parent {
+            p.parent = match s.to_ascii_lowercase().as_str() {
+                "off" => ParentMode::Off,
+                "container-only" => ParentMode::ContainerOnly,
+                "bidirectional" => ParentMode::Bidirectional,
+                other => {
+                    return Err(format!(
+                        "[edges].parent = \"{other}\" — valid: off, container-only, bidirectional",
+                    ));
+                }
+            };
+        }
+        if let Some(s) = self.derived_from {
+            p.derived_from = match s.to_ascii_lowercase().as_str() {
+                "off" => DerivedMode::Off,
+                "co-retrieve-source" => DerivedMode::CoRetrieveSource,
+                "suppress-source" => DerivedMode::SuppressSource,
+                other => {
+                    return Err(format!(
+                        "[edges].derived_from = \"{other}\" — valid: off, co-retrieve-source, suppress-source",
+                    ));
+                }
+            };
+        }
+        if let Some(s) = self.supports {
+            p.supports = match s.to_ascii_lowercase().as_str() {
+                "off" => SupportsMode::Off,
+                "co-retrieve" => SupportsMode::CoRetrieve,
+                other => {
+                    return Err(format!(
+                        "[edges].supports = \"{other}\" — valid: off, co-retrieve",
+                    ));
+                }
+            };
+        }
+        if let Some(s) = self.contradicts {
+            p.contradicts = match s.to_ascii_lowercase().as_str() {
+                "off" => ContradictMode::Off,
+                "prefer-newer" => ContradictMode::PreferNewer,
+                "flag" => ContradictMode::Flag,
+                other => {
+                    return Err(format!(
+                        "[edges].contradicts = \"{other}\" — valid: off, prefer-newer, flag",
+                    ));
+                }
+            };
+        }
+        if let Some(s) = self.tool_invocation {
+            p.tool_invocation = match s.to_ascii_lowercase().as_str() {
+                "off" => ToolMode::Off,
+                "co-retrieve" => ToolMode::CoRetrieve,
+                other => {
+                    return Err(format!(
+                        "[edges].tool_invocation = \"{other}\" — valid: off, co-retrieve",
+                    ));
+                }
+            };
+        }
+        Ok(p)
+    }
+}
+
 // ---------- Parsing + applying ----------
 
 /// Read a TOML config file from disk.
@@ -253,6 +360,9 @@ pub struct Applied {
     pub section_budgets: Option<SectionBudgetTable>,
     pub packer_options: Option<PackerOptions>,
     pub store: Option<StoreEntry>,
+    /// Resolved edge policy from `[edges]`, or `None` when the section
+    /// is absent (callers then use [`EdgePolicy::default`]).
+    pub edge_policy: Option<EdgePolicy>,
 }
 
 /// Fold `[[profile]]` and `[[hf_tokenizer]]` entries into the given
@@ -284,11 +394,13 @@ pub fn apply(
         let opts = packer_options.get_or_insert_with(PackerOptions::default);
         opts.cache = cache_opts;
     }
+    let edge_policy = parsed.edges.map(EdgeEntry::build).transpose()?;
     Ok(Applied {
         retrievers: parsed.retriever,
         section_budgets: parsed.section_budgets.map(SectionBudgetEntry::build),
         packer_options,
         store: parsed.store,
+        edge_policy,
     })
 }
 

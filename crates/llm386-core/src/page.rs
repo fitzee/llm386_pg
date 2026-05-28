@@ -38,6 +38,13 @@ pub struct Selection {
     pub block_id: BlockId,
     pub score: f32,
     pub reason: SelectionReason,
+    /// Optional human-readable annotation the packer renders inline
+    /// with the block. Set by edge-aware reconciliation — e.g. a
+    /// `Contradicts` edge in `Flag` mode tags the demoted block with
+    /// `"contradicted by newer block <id>"`. `None` for the common
+    /// case. Defaulted on deserialize so older serialized plans load.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Why the pager included a particular block in the working set.
@@ -83,4 +90,12 @@ pub enum OmissionReason {
     /// Block did not fit but a Summary block referencing it was
     /// included in its place.
     Compressed,
+    /// Block was dropped because a `Contradicts` edge linked it to a
+    /// newer / higher-priority block that the pager kept instead
+    /// (edge policy `Contradicts = PreferNewer`).
+    Contradicted,
+    /// Block was dropped because a `DerivedFrom` edge marked it as the
+    /// source of a derivative (summary / distillation) that was
+    /// already selected (edge policy `DerivedFrom = SuppressSource`).
+    SupersededByDerived,
 }

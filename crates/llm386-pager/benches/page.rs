@@ -47,6 +47,7 @@ fn bench_page_profile() -> ModelProfile {
         reserved_output_tokens: 0,
         safety_margin_tokens: 0,
         tokenizer: TokenizerId::new("cl100k_base"),
+        family: None,
         supports_system_role: true,
         supports_tools: true,
     }

@@ -271,7 +271,7 @@ llm386 --store ./store pack --session 1 --model gpt-4o --task "..." \
 
 ## Edges
 
-Typed directed edges add structure beyond `Provenance.parents`. The pager follows them when assembling a working set, so dependent blocks travel together. Five kinds: `parent`, `derived-from`, `supports`, `contradicts`, `tool-invocation`.
+Typed directed edges add structure beyond `Provenance.parents`. The pager acts on each kind's *meaning* when assembling a working set (see [Edge-aware paging](#edge-aware-paging) for the per-kind behavior and how to configure it). Five kinds: `parent`, `derived-from`, `supports`, `contradicts`, `tool-invocation`. Edges are directed — `from` is the referencing block, `to` is the referenced one (a child→parent edge has the child as `from`).
 
 ### `add-edge`
 
@@ -306,6 +306,45 @@ llm386 [--store <path> | --pg-url <url>] edges [--incoming] <block-id>
 List edges incident to a block. Outgoing by default; `--incoming` flips the direction. Output format: `<from> --<Kind>--> <to>`.
 
 **Use when:** auditing what's connected to a block, debugging why the pager pulled in an apparently-unrelated block (it likely arrived via an edge), or cleaning up after a buggy reducer that committed too many edges.
+
+---
+
+### Edge-aware paging
+
+After the per-section fill, the pager runs two bounded passes over the edges, governed by an `[edges]` config block. **Expansion** pulls dependent blocks *in*; **reconciliation** acts on the already-selected set to suppress or flag.
+
+| Kind | Default mode | Behavior |
+|------|--------------|----------|
+| `parent` | `container-only` | Selecting a child pulls its container. `bidirectional` also pulls a container's children (fan-out-capped). |
+| `derived-from` | `co-retrieve-source` | Selecting a summary/derivative also pulls its source. `suppress-source` instead **drops** a source the selected derivative already covers (omitted as `SupersededByDerived`). |
+| `supports` | `co-retrieve` | Selecting a claim co-retrieves its supporting evidence. |
+| `contradicts` | `flag` | Of two mutually-contradicting selected blocks, keep the newer / higher-priority one; `flag` annotates the other inline (`contradicted by newer block …`), `prefer-newer` **drops** it (omitted as `Contradicted`). Never pulls anything in. |
+| `tool-invocation` | `co-retrieve` | Selecting an assistant turn co-retrieves the tool result it consumed. |
+
+Pulled-in blocks are tagged `SelectionReason::Dependency`. Each mode can be set to `off` independently, or set `enabled = false` to ignore all edges.
+
+**Bounds.** Traversal is depth- and fan-out-capped so it can't blow the token budget or latency floor:
+
+- `max_depth` — hops from any originally-selected block (default `1`, hard ceiling `5`).
+- `max_fanout` — neighbors expanded per block *per kind* (default `8`); when exceeded, the newest are kept.
+- `follow_provenance_parents` — also walk `Provenance.parents` lineage (default `false`; the typed `parent`/`derived-from` edges normally carry the same link).
+
+**Config (`[edges]` in the profiles TOML; every field optional):**
+
+```toml
+[edges]
+enabled = true
+max_depth = 1
+max_fanout = 8
+follow_provenance_parents = false
+parent = "container-only"          # off | container-only | bidirectional
+derived_from = "co-retrieve-source" # off | co-retrieve-source | suppress-source
+supports = "co-retrieve"            # off | co-retrieve
+contradicts = "flag"                # off | prefer-newer | flag
+tool_invocation = "co-retrieve"     # off | co-retrieve
+```
+
+The same TOML is honored by the Python `Store(profiles=...)`. Defaults enable every kind, so an existing deployment that creates edges will see them influence packing after upgrading — set `enabled = false` to keep the prior edge-agnostic behavior.
 
 ---
 

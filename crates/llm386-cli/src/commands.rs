@@ -17,7 +17,7 @@ use llm386_core::{
     Tokenizer, TraceRecord, TraceSink, default_registry,
 };
 use llm386_packer::SimplePacker;
-use llm386_pager::GreedyPager;
+use llm386_pager::{EdgePolicy, GreedyPager};
 use llm386_store_lmdb::{LmdbStore, StoreConfig};
 use llm386_tokenizer::{TokenizerRegistry, default_registry as tokenizer_registry};
 use llm386_trace::LmdbTraceSink;
@@ -40,6 +40,9 @@ pub(crate) struct LoadedConfig {
     /// Optional `[store]` from the TOML — combined with the global
     /// `--store` / `--pg-url` flags by [`open_block_store`].
     pub store: Option<StoreEntry>,
+    /// Optional `[edges]` policy from the TOML. `None` → the pager's
+    /// default ([`EdgePolicy::default`]).
+    pub edge_policy: Option<EdgePolicy>,
 }
 
 /// Load the built-in registries, then fold in user-supplied
@@ -62,6 +65,7 @@ pub(crate) fn load_config(flag_path: Option<&Path>) -> Result<LoadedConfig> {
             section_budgets: None,
             packer_options: None,
             store: None,
+            edge_policy: None,
         }
     };
 
@@ -72,6 +76,7 @@ pub(crate) fn load_config(flag_path: Option<&Path>) -> Result<LoadedConfig> {
         section_budgets: applied.section_budgets,
         packer_options: applied.packer_options.unwrap_or_default(),
         store: applied.store,
+        edge_policy: applied.edge_policy,
     })
 }
 
@@ -271,6 +276,9 @@ fn make_pager<S: BlockStore + 'static>(
     }
     if let Some(budgets) = &config.section_budgets {
         pager = pager.with_budgets(budgets.clone());
+    }
+    if let Some(edge_policy) = config.edge_policy {
+        pager = pager.with_edge_policy(edge_policy);
     }
     Ok(pager)
 }

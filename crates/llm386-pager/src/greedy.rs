@@ -2,18 +2,19 @@
 //! per-section budgets.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
 use llm386_core::{
-    BlockId, BlockKind, BlockStore, ContextBlock, OmissionReason, OmittedBlock, PagePlan,
-    PageRequest, Pager, PagerError, Retriever, SectionKind, Selection, SelectionReason,
+    BlockId, BlockKind, BlockStore, ContextBlock, Edge, EdgeKind, OmissionReason, OmittedBlock,
+    PagePlan, PageRequest, Pager, PagerError, Retriever, SectionKind, Selection, SelectionReason,
     TokenCount, Tokenizer,
 };
 use tracing::instrument;
 
 use crate::budget::SectionBudgetTable;
+use crate::edges::{ContradictMode, DerivedMode, EdgePolicy};
 use crate::retrievers::RecencyRetriever;
 
 /// Cap on candidates each retriever may surface per call. Tunable
@@ -33,13 +34,15 @@ const RETRIEVAL_LIMIT: usize = 4_096;
 /// set has Jaccard similarity ≥ `t` with any block already selected
 /// in the same section. `None` (the default) disables the check.
 ///
-/// `include_parents` controls edge-aware inclusion. When `true`,
-/// after the per-section fill the pager walks every selected
-/// block's `Provenance.parents` (transitively) and pulls in any
-/// unselected ancestor that still fits the global `input_budget`.
-/// Useful for keeping `tool_result` blocks paired with the
-/// `tool_call` (or assistant message) that produced them. Default
-/// `false` to preserve the prior behavior.
+/// `edge_policy` controls edge-aware inclusion — see [`EdgePolicy`].
+/// After the per-section fill, the pager runs two passes governed by
+/// this policy: an *expansion* pass that pulls dependent blocks in
+/// (claim → evidence, assistant turn → tool result, child →
+/// container, derivative → source) bounded by depth and fan-out, and
+/// a *reconciliation* pass that demotes `Contradicts` losers and
+/// optionally suppresses sources a selected summary supersedes. The
+/// default enables every edge kind; use [`EdgePolicy::disabled`] to
+/// skip edge-following entirely.
 ///
 /// `summary_fallback` enables COLD-tier substitution. When `true`, a
 /// candidate that doesn't fit its section budget is
@@ -51,7 +54,7 @@ const RETRIEVAL_LIMIT: usize = 4_096;
 pub struct ScoringPolicy {
     pub priority_weight: f32,
     pub redundancy_threshold: Option<f32>,
-    pub include_parents: bool,
+    pub edge_policy: EdgePolicy,
     pub summary_fallback: bool,
 }
 
@@ -60,7 +63,7 @@ impl Default for ScoringPolicy {
         Self {
             priority_weight: 0.5,
             redundancy_threshold: None,
-            include_parents: false,
+            edge_policy: EdgePolicy::default(),
             summary_fallback: false,
         }
     }
@@ -109,6 +112,15 @@ impl<S: BlockStore + 'static> GreedyPager<S> {
     #[must_use]
     pub fn with_scoring(mut self, scoring: ScoringPolicy) -> Self {
         self.scoring = scoring;
+        self
+    }
+
+    /// Override just the edge policy, leaving the rest of the scoring
+    /// policy untouched. Convenience for config plumbing that only
+    /// surfaces edge behavior.
+    #[must_use]
+    pub fn with_edge_policy(mut self, edge_policy: EdgePolicy) -> Self {
+        self.scoring.edge_policy = edge_policy;
         self
     }
 
@@ -189,7 +201,12 @@ impl<S: BlockStore + 'static> Pager for GreedyPager<S> {
             prompt_total = prompt_total.saturating_add(tokens);
             block_tokens = block_tokens.saturating_add(tokens);
             selected.push(id);
-            selections.push(Selection { block_id: id, score: 1.0, reason: SelectionReason::Pinned });
+            selections.push(Selection {
+                block_id: id,
+                score: 1.0,
+                reason: SelectionReason::Pinned,
+                note: None,
+            });
             required_set.insert(id);
         }
 
@@ -265,6 +282,7 @@ impl<S: BlockStore + 'static> Pager for GreedyPager<S> {
                         block_id: cand.id,
                         score: cand.score,
                         reason: SelectionReason::HighRelevance,
+                        note: None,
                     });
                 } else {
                     omitted.push(OmittedBlock {
@@ -334,6 +352,7 @@ impl<S: BlockStore + 'static> Pager for GreedyPager<S> {
                         block_id: cand.id,
                         score: cand.score,
                         reason: SelectionReason::HighRelevance,
+                        note: None,
                     });
                     if let Some(set) = cand.word_set {
                         section_word_sets.push(set);
@@ -376,6 +395,7 @@ impl<S: BlockStore + 'static> Pager for GreedyPager<S> {
                             block_id: summary_id,
                             score: cand.score,
                             reason: SelectionReason::HighRelevance,
+                            note: None,
                         });
                         compressed_into.insert(summary_id);
                         omitted.push(OmittedBlock {
@@ -400,52 +420,35 @@ impl<S: BlockStore + 'static> Pager for GreedyPager<S> {
             }
         }
 
-        // === Step 6: optionally pull in ancestors of selected blocks ===
-        // Tool results, derived summaries, and reply chains carry
-        // their context in `Provenance.parents`. When edge-aware
-        // inclusion is enabled, walk those chains transitively and
-        // append any unselected ancestor that still fits the global
-        // budget. Section budgets are bypassed here on purpose —
-        // missing parents would break the meaning of children that
-        // already made the cut.
-        if self.scoring.include_parents {
-            let mut visited: HashSet<BlockId> = selected.iter().copied().collect();
-            let mut frontier: Vec<BlockId> = selected.clone();
-            while let Some(id) = frontier.pop() {
-                let Some(block) = self.store.get(id)? else {
-                    continue;
-                };
-                // Lineage from `Provenance.parents` plus any typed
-                // outgoing edges from the typed edges table. The
-                // store returns an empty vec if no edges DB exists,
-                // so this is a no-op for legacy backends.
-                let mut deps: Vec<BlockId> = block.provenance.parents.clone();
-                for edge in self.store.edges_from(id)? {
-                    deps.push(edge.to);
-                }
-                for parent_id in deps {
-                    if !visited.insert(parent_id) {
-                        continue;
-                    }
-                    let Some(parent) = self.store.get(parent_id)? else {
-                        continue;
-                    };
-                    let tokens = self.tokens_for(&parent)?;
-                    if prompt_total.saturating_add(tokens).0 <= input_budget.0 {
-                        prompt_total = prompt_total.saturating_add(tokens);
-                        block_tokens = block_tokens.saturating_add(tokens);
-                        selected.push(parent_id);
-                        selections.push(Selection {
-                            block_id: parent_id,
-                            score: 0.0,
-                            reason: SelectionReason::Dependency,
-                        });
-                        frontier.push(parent_id);
-                    }
-                    // If the parent didn't fit we still mark it visited
-                    // so we don't loop on it; intentionally not adding
-                    // to omitted (it was never on the candidate path).
-                }
+        // === Step 6: edge-aware expansion + reconciliation ===
+        // Typed edges turn "these blocks are related" into concrete
+        // behavior. The expansion pass pulls dependent blocks in
+        // (claim → evidence, assistant turn → tool result, child →
+        // container, derivative → source), bounded by depth and
+        // fan-out. The reconciliation pass then acts on the final
+        // selected set: it demotes `Contradicts` losers and suppresses
+        // sources a selected summary supersedes. Section budgets are
+        // bypassed for pulled-in dependencies on purpose — a missing
+        // dependency would break the meaning of a block that already
+        // made the cut.
+        let policy = self.scoring.edge_policy;
+        if policy.enabled {
+            self.expand_edges(
+                &policy,
+                input_budget,
+                &mut selected,
+                &mut selections,
+                &mut prompt_total,
+                &mut block_tokens,
+            )?;
+            if policy.reconciles() {
+                self.reconcile_edges(
+                    &policy,
+                    &mut selected,
+                    &mut selections,
+                    &mut omitted,
+                    &mut block_tokens,
+                )?;
             }
         }
 
@@ -503,6 +506,234 @@ impl<S: BlockStore> GreedyPager<S> {
         }
         Ok(self.tokenizer.count(&block.bytes)?)
     }
+
+    /// Expansion pass: bounded BFS that pulls dependent blocks into the
+    /// working set per the [`EdgePolicy`]. Walks outgoing edges (and,
+    /// for `Parent` in `Bidirectional` mode, incoming edges to reach
+    /// children). Depth is capped by [`EdgePolicy::effective_depth`]
+    /// and per-kind fan-out by [`EdgePolicy::max_fanout`]; every pull
+    /// must still fit the global `input_budget`. Pulled blocks are
+    /// tagged [`SelectionReason::Dependency`].
+    fn expand_edges(
+        &self,
+        policy: &EdgePolicy,
+        input_budget: TokenCount,
+        selected: &mut Vec<BlockId>,
+        selections: &mut Vec<Selection>,
+        prompt_total: &mut TokenCount,
+        block_tokens: &mut TokenCount,
+    ) -> Result<(), PagerError> {
+        let max_depth = policy.effective_depth();
+        if max_depth == 0 {
+            return Ok(());
+        }
+        let mut visited: HashSet<BlockId> = selected.iter().copied().collect();
+        let mut frontier: VecDeque<(BlockId, u8)> =
+            selected.iter().map(|id| (*id, 0u8)).collect();
+
+        while let Some((id, depth)) = frontier.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            let Some(block) = self.store.get(id)? else {
+                continue;
+            };
+
+            // Kind-aware candidate dependencies for this block.
+            let mut deps: Vec<BlockId> = Vec::new();
+            if policy.follow_provenance_parents {
+                deps.extend(block.provenance.parents.iter().copied());
+            }
+            collect_outgoing(policy, &self.store.edges_from(id)?, &mut deps);
+            if policy.pulls_children() {
+                collect_children(policy, &self.store.edges_to(id)?, &mut deps);
+            }
+
+            for dep_id in deps {
+                if !visited.insert(dep_id) {
+                    continue;
+                }
+                let Some(dep) = self.store.get(dep_id)? else {
+                    continue;
+                };
+                let tokens = self.tokens_for(&dep)?;
+                if prompt_total.saturating_add(tokens).0 <= input_budget.0 {
+                    *prompt_total = prompt_total.saturating_add(tokens);
+                    *block_tokens = block_tokens.saturating_add(tokens);
+                    selected.push(dep_id);
+                    selections.push(Selection {
+                        block_id: dep_id,
+                        score: 0.0,
+                        reason: SelectionReason::Dependency,
+                        note: None,
+                    });
+                    frontier.push_back((dep_id, depth + 1));
+                }
+                // If it didn't fit we still leave it visited so we
+                // don't loop on it; not added to omitted (it was never
+                // a ranked candidate).
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconciliation pass: acts on the *final* selected set. Demotes
+    /// `Contradicts` losers (drop under `PreferNewer`, annotate under
+    /// `Flag`) and suppresses `DerivedFrom` sources a selected
+    /// derivative supersedes. Never pulls anything in. Pinned blocks
+    /// are never dropped — at most annotated.
+    fn reconcile_edges(
+        &self,
+        policy: &EdgePolicy,
+        selected: &mut Vec<BlockId>,
+        selections: &mut Vec<Selection>,
+        omitted: &mut Vec<OmittedBlock>,
+        block_tokens: &mut TokenCount,
+    ) -> Result<(), PagerError> {
+        let selected_set: HashSet<BlockId> = selected.iter().copied().collect();
+        let pinned: HashSet<BlockId> = selections
+            .iter()
+            .filter(|s| s.reason == SelectionReason::Pinned)
+            .map(|s| s.block_id)
+            .collect();
+
+        let mut to_remove: HashMap<BlockId, OmissionReason> = HashMap::new();
+        let mut notes: HashMap<BlockId, String> = HashMap::new();
+
+        for &id in selected.iter() {
+            for e in self.store.edges_from(id)? {
+                match e.kind {
+                    // id = derivative (from), e.to = source. Drop the
+                    // source when both are selected and it isn't pinned.
+                    EdgeKind::DerivedFrom
+                        if policy.derived_from == DerivedMode::SuppressSource
+                            && id != e.to
+                            && selected_set.contains(&e.to)
+                            && !pinned.contains(&e.to) =>
+                    {
+                        to_remove
+                            .entry(e.to)
+                            .or_insert(OmissionReason::SupersededByDerived);
+                    }
+                    // id = B (from) contradicts e.to = A. Resolve only
+                    // when both endpoints are in the set.
+                    EdgeKind::Contradicts
+                        if policy.contradicts != ContradictMode::Off
+                            && id != e.to
+                            && selected_set.contains(&e.to) =>
+                    {
+                        let (loser, winner) = self.resolve_contradiction(id, e.to)?;
+                        match policy.contradicts {
+                            ContradictMode::PreferNewer if !pinned.contains(&loser) => {
+                                to_remove
+                                    .entry(loser)
+                                    .or_insert(OmissionReason::Contradicted);
+                            }
+                            // Pinned loser under PreferNewer, or Flag
+                            // mode: keep the block, annotate it.
+                            ContradictMode::PreferNewer | ContradictMode::Flag => {
+                                notes.entry(loser).or_insert_with(|| {
+                                    format!("contradicted by newer block {winner}")
+                                });
+                            }
+                            ContradictMode::Off => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if to_remove.is_empty() && notes.is_empty() {
+            return Ok(());
+        }
+
+        // Rebuild selected/selections in lockstep, dropping removals
+        // and stamping notes onto survivors.
+        let mut new_selected = Vec::with_capacity(selected.len());
+        let mut new_selections = Vec::with_capacity(selections.len());
+        for (id, mut sel) in selected.iter().copied().zip(selections.drain(..)) {
+            if let Some(reason) = to_remove.get(&id) {
+                if let Some(block) = self.store.get(id)? {
+                    let tokens = self.tokens_for(&block)?;
+                    *block_tokens = TokenCount(block_tokens.0.saturating_sub(tokens.0));
+                }
+                omitted.push(OmittedBlock {
+                    block_id: id,
+                    reason: *reason,
+                    score: sel.score,
+                });
+                continue;
+            }
+            if let Some(note) = notes.get(&id) {
+                sel.note = Some(note.clone());
+            }
+            new_selected.push(id);
+            new_selections.push(sel);
+        }
+        *selected = new_selected;
+        *selections = new_selections;
+        Ok(())
+    }
+
+    /// Pick the winner of a `Contradicts` pair: newer (later
+    /// `created_at`) wins; ties break by higher `priority`, then larger
+    /// id. Returns `(loser, winner)`.
+    fn resolve_contradiction(
+        &self,
+        a: BlockId,
+        b: BlockId,
+    ) -> Result<(BlockId, BlockId), PagerError> {
+        let block_a = self.store.get(a)?;
+        let block_b = self.store.get(b)?;
+        let winner_is_a = match (block_a, block_b) {
+            (Some(x), Some(y)) => match x.created_at.0.cmp(&y.created_at.0) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => match x.priority.partial_cmp(&y.priority) {
+                    Some(Ordering::Greater) => true,
+                    Some(Ordering::Less) => false,
+                    _ => x.id.0 >= y.id.0,
+                },
+            },
+            (None, Some(_)) => false,
+            // Either `a` is the only one present, or both are missing —
+            // default to `a` as the winner.
+            (Some(_) | None, None) => true,
+        };
+        if winner_is_a { Ok((b, a)) } else { Ok((a, b)) }
+    }
+}
+
+/// Gather outgoing-edge `to` endpoints that the policy says to pull,
+/// applying the per-kind fan-out cap (newest-first by block id).
+fn collect_outgoing(policy: &EdgePolicy, edges: &[Edge], out: &mut Vec<BlockId>) {
+    let mut by_kind: HashMap<EdgeKind, Vec<BlockId>> = HashMap::new();
+    for e in edges {
+        if policy.pulls_outgoing(e.kind) {
+            by_kind.entry(e.kind).or_default().push(e.to);
+        }
+    }
+    for (_kind, mut tos) in by_kind {
+        // BlockId high bits are the creation timestamp, so descending
+        // id order is newest-first.
+        tos.sort_by(|a, b| b.cmp(a));
+        tos.truncate(policy.max_fanout);
+        out.extend(tos);
+    }
+}
+
+/// Gather child `from` endpoints of `Parent` edges that terminate at a
+/// selected container, applying the fan-out cap (newest-first).
+fn collect_children(policy: &EdgePolicy, in_edges: &[Edge], out: &mut Vec<BlockId>) {
+    let mut kids: Vec<BlockId> = in_edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Parent)
+        .map(|e| e.from)
+        .collect();
+    kids.sort_by(|a, b| b.cmp(a));
+    kids.truncate(policy.max_fanout);
+    out.extend(kids);
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -549,11 +780,56 @@ mod tests {
 
     use super::*;
 
-    fn setup() -> (Arc<LmdbStore>, TempDir, Arc<dyn Tokenizer>) {
+    // macOS returns `LMDB: Invalid argument (os error 22)` once too
+    // many LMDB envs are mmap-active in one process at once — a
+    // platform concurrency ceiling, not a logic bug (the sibling
+    // `llm386-store-lmdb` suite stays under it at 21 tests; this one
+    // has many more). Cap how many test stores are live simultaneously
+    // with a tiny counting semaphore. The permit rides on the guard
+    // returned in the `_dir` slot, so it's released when each test
+    // ends — no test body needs to change.
+    struct Semaphore {
+        permits: std::sync::Mutex<usize>,
+        avail: std::sync::Condvar,
+    }
+    impl Semaphore {
+        const fn new(n: usize) -> Self {
+            Self {
+                permits: std::sync::Mutex::new(n),
+                avail: std::sync::Condvar::new(),
+            }
+        }
+        fn acquire(&self) {
+            let mut n = self.permits.lock().unwrap();
+            while *n == 0 {
+                n = self.avail.wait(n).unwrap();
+            }
+            *n -= 1;
+        }
+        fn release(&self) {
+            *self.permits.lock().unwrap() += 1;
+            self.avail.notify_one();
+        }
+    }
+    static STORE_SEM: Semaphore = Semaphore::new(6);
+
+    /// Holds the temp dir plus a concurrency permit for the lifetime of
+    /// a test. Tests bind it in the `_dir` slot and never touch it.
+    struct TestEnv {
+        _dir: TempDir,
+    }
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            STORE_SEM.release();
+        }
+    }
+
+    fn setup() -> (Arc<LmdbStore>, TestEnv, Arc<dyn Tokenizer>) {
+        STORE_SEM.acquire();
         let dir = TempDir::new().unwrap();
         let store = Arc::new(LmdbStore::open(dir.path(), StoreConfig::default()).unwrap());
         let tok: Arc<dyn Tokenizer> = Arc::new(cl100k_base().unwrap());
-        (store, dir, tok)
+        (store, TestEnv { _dir: dir }, tok)
     }
 
     fn block(bytes: &[u8], kind: BlockKind, ts_ms: u64, rnd: u128) -> ContextBlock {
@@ -577,6 +853,7 @@ mod tests {
             reserved_output_tokens: reserved,
             safety_margin_tokens: 0,
             tokenizer: TokenizerId::new("cl100k_base"),
+            family: None,
             supports_system_role: true,
             supports_tools: true,
         }
@@ -884,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn include_parents_pulls_in_ancestor_blocks() {
+    fn follow_provenance_parents_pulls_in_ancestor_blocks() {
         let (store, _dir, tok) = setup();
         let session = SessionId(1);
         // Parent first.
@@ -894,14 +1171,18 @@ mod tests {
                 block(b"called the foo tool", BlockKind::AssistantMessage, 1, 1),
             )
             .unwrap();
-        // Child block whose provenance.parents references the parent.
+        // Child block whose provenance.parents references the parent
+        // (no typed edge — this exercises the legacy lineage path).
         let mut child = block(b"{\"result\": 42}", BlockKind::ToolResult, 2, 2);
         child.provenance.parents = vec![parent_id];
         let child_id = store.put(session, child).unwrap();
 
-        // Disable retrievers and ask for only the child via required.
+        // Provenance-parent following is off by default; opt in.
         let policy = ScoringPolicy {
-            include_parents: true,
+            edge_policy: EdgePolicy {
+                follow_provenance_parents: true,
+                ..EdgePolicy::default()
+            },
             ..ScoringPolicy::default()
         };
         let pager = GreedyPager::new(store, tok)
@@ -916,58 +1197,16 @@ mod tests {
             })
             .unwrap();
         // Child was required; parent should be pulled in via the
-        // ancestor walk.
+        // provenance walk.
         assert!(plan.selected.contains(&child_id));
         assert!(plan.selected.contains(&parent_id));
     }
 
     #[test]
-    fn include_parents_follows_typed_edges_too() {
-        // Pulled-in dependencies can come from `Provenance.parents`
-        // *or* from the typed edges table. The pager treats both as
-        // SelectionReason::Dependency.
-        let (store, _dir, tok) = setup();
-        let session = SessionId(1);
-        let evidence_id = store
-            .put(session, block(b"the supporting fact", BlockKind::Fact, 1, 1))
-            .unwrap();
-        let claim_id = store
-            .put(session, block(b"the claim", BlockKind::AssistantMessage, 2, 2))
-            .unwrap();
-        store
-            .put_edge(llm386_core::Edge {
-                from: claim_id,
-                to: evidence_id,
-                kind: llm386_core::EdgeKind::Supports,
-            })
-            .unwrap();
-
-        let policy = ScoringPolicy {
-            include_parents: true,
-            ..ScoringPolicy::default()
-        };
-        let pager = GreedyPager::new(store, tok)
-            .with_retrievers(vec![])
-            .with_scoring(policy);
-        let plan = pager
-            .page(PageRequest {
-                session_id: session,
-                task: String::new(),
-                model: profile(1_000, 0),
-                required_blocks: vec![claim_id],
-            })
-            .unwrap();
-        assert!(plan.selected.contains(&evidence_id));
-        let evidence_sel = plan
-            .selections
-            .iter()
-            .find(|s| s.block_id == evidence_id)
-            .unwrap();
-        assert!(matches!(evidence_sel.reason, SelectionReason::Dependency));
-    }
-
-    #[test]
-    fn include_parents_disabled_by_default_skips_ancestors() {
+    fn provenance_parents_not_followed_by_default() {
+        // Default edge policy is on, but it follows *typed edges* — not
+        // `Provenance.parents`. A child linked only by provenance does
+        // not drag its parent in unless follow_provenance_parents is set.
         let (store, _dir, tok) = setup();
         let session = SessionId(1);
         let parent_id = store
@@ -980,7 +1219,6 @@ mod tests {
         child.provenance.parents = vec![parent_id];
         let child_id = store.put(session, child).unwrap();
 
-        // Default policy → no parent walk.
         let pager = GreedyPager::new(store, tok).with_retrievers(vec![]);
         let plan = pager
             .page(PageRequest {
@@ -992,6 +1230,433 @@ mod tests {
             .unwrap();
         assert!(plan.selected.contains(&child_id));
         assert!(!plan.selected.contains(&parent_id));
+    }
+
+    #[test]
+    fn edge_policy_disabled_skips_dependencies() {
+        // With EdgePolicy::disabled, even a typed Parent edge is
+        // ignored — the container is not pulled in.
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let parent_id = store
+            .put(
+                session,
+                block(b"called the foo tool", BlockKind::AssistantMessage, 1, 1),
+            )
+            .unwrap();
+        let child_id = store
+            .put(session, block(b"{\"result\": 42}", BlockKind::ToolResult, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge {
+                from: child_id,
+                to: parent_id,
+                kind: EdgeKind::Parent,
+            })
+            .unwrap();
+
+        let policy = ScoringPolicy {
+            edge_policy: EdgePolicy::disabled(),
+            ..ScoringPolicy::default()
+        };
+        let pager = GreedyPager::new(store, tok)
+            .with_retrievers(vec![])
+            .with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![child_id],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&child_id));
+        assert!(!plan.selected.contains(&parent_id));
+    }
+
+    fn scoring_with(edge_policy: EdgePolicy) -> ScoringPolicy {
+        ScoringPolicy {
+            edge_policy,
+            ..ScoringPolicy::default()
+        }
+    }
+
+    #[test]
+    fn supports_edge_co_retrieves_evidence() {
+        // Selecting a claim co-retrieves its supporting evidence.
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let evidence = store
+            .put(session, block(b"supporting fact", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let claim = store
+            .put(session, block(b"the claim", BlockKind::AssistantMessage, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: claim, to: evidence, kind: EdgeKind::Supports })
+            .unwrap();
+        // Default policy (Supports = CoRetrieve), retrievers off so
+        // only the required claim seeds the working set.
+        let pager = GreedyPager::new(store, tok).with_retrievers(vec![]);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![claim],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&evidence));
+        let sel = plan.selections.iter().find(|s| s.block_id == evidence).unwrap();
+        assert!(matches!(sel.reason, SelectionReason::Dependency));
+    }
+
+    #[test]
+    fn supports_off_skips_evidence() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let evidence = store
+            .put(session, block(b"supporting fact", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let claim = store
+            .put(session, block(b"the claim", BlockKind::AssistantMessage, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: claim, to: evidence, kind: EdgeKind::Supports })
+            .unwrap();
+        let policy = scoring_with(EdgePolicy {
+            supports: crate::SupportsMode::Off,
+            ..EdgePolicy::default()
+        });
+        let pager = GreedyPager::new(store, tok)
+            .with_retrievers(vec![])
+            .with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![claim],
+            })
+            .unwrap();
+        assert!(!plan.selected.contains(&evidence));
+    }
+
+    #[test]
+    fn tool_invocation_pulls_in_result() {
+        // The backward-compatible path: an assistant turn that called a
+        // tool drags its result along.
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let assistant = store
+            .put(session, block(b"calling read_file", BlockKind::AssistantMessage, 1, 1))
+            .unwrap();
+        let result = store
+            .put(session, block(b"{\"bytes\": 4096}", BlockKind::ToolResult, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: assistant, to: result, kind: EdgeKind::ToolInvocation })
+            .unwrap();
+        let pager = GreedyPager::new(store, tok).with_retrievers(vec![]);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![assistant],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&result));
+    }
+
+    #[test]
+    fn parent_container_only_pulls_container_not_children() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let parent = store
+            .put(session, block(b"the document", BlockKind::DocumentChunk, 1, 1))
+            .unwrap();
+        let child = store
+            .put(session, block(b"a chunk", BlockKind::DocumentChunk, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: child, to: parent, kind: EdgeKind::Parent })
+            .unwrap();
+
+        // child selected → container pulled (default ContainerOnly).
+        let pager = GreedyPager::new(store.clone(), tok.clone()).with_retrievers(vec![]);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![child],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&parent));
+
+        // container selected → child NOT pulled under ContainerOnly.
+        let pager = GreedyPager::new(store, tok).with_retrievers(vec![]);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![parent],
+            })
+            .unwrap();
+        assert!(!plan.selected.contains(&child));
+    }
+
+    #[test]
+    fn parent_bidirectional_pulls_children() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let parent = store
+            .put(session, block(b"the document", BlockKind::DocumentChunk, 1, 1))
+            .unwrap();
+        let child_a = store
+            .put(session, block(b"chunk a", BlockKind::DocumentChunk, 2, 2))
+            .unwrap();
+        let child_b = store
+            .put(session, block(b"chunk b", BlockKind::DocumentChunk, 3, 3))
+            .unwrap();
+        store
+            .put_edge(Edge { from: child_a, to: parent, kind: EdgeKind::Parent })
+            .unwrap();
+        store
+            .put_edge(Edge { from: child_b, to: parent, kind: EdgeKind::Parent })
+            .unwrap();
+        let policy = scoring_with(EdgePolicy {
+            parent: crate::ParentMode::Bidirectional,
+            ..EdgePolicy::default()
+        });
+        let pager = GreedyPager::new(store, tok)
+            .with_retrievers(vec![])
+            .with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![parent],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&child_a));
+        assert!(plan.selected.contains(&child_b));
+    }
+
+    #[test]
+    fn derived_from_co_retrieves_source() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let source = store
+            .put(session, block(b"the long original", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let derived = store
+            .put(session, block(b"short summary", BlockKind::Summary, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: derived, to: source, kind: EdgeKind::DerivedFrom })
+            .unwrap();
+        // Default DerivedFrom = CoRetrieveSource. Only the derivative
+        // is required; its source should be pulled in.
+        let pager = GreedyPager::new(store, tok).with_retrievers(vec![]);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![derived],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&source));
+    }
+
+    #[test]
+    fn derived_from_suppress_source_drops_redundant_source() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let source = store
+            .put(session, block(b"the long original", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let derived = store
+            .put(session, block(b"short summary", BlockKind::Summary, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: derived, to: source, kind: EdgeKind::DerivedFrom })
+            .unwrap();
+        let policy = scoring_with(EdgePolicy {
+            derived_from: DerivedMode::SuppressSource,
+            ..EdgePolicy::default()
+        });
+        // Default recency retriever selects both blocks; suppression
+        // then drops the source the summary supersedes.
+        let pager = GreedyPager::new(store, tok).with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&derived));
+        assert!(!plan.selected.contains(&source));
+        let dropped = plan.omitted.iter().find(|o| o.block_id == source).unwrap();
+        assert_eq!(dropped.reason, OmissionReason::SupersededByDerived);
+    }
+
+    #[test]
+    fn contradicts_flag_annotates_the_older_block() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let older = store
+            .put(session, block(b"the sky is green", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let newer = store
+            .put(session, block(b"the sky is blue", BlockKind::Fact, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: newer, to: older, kind: EdgeKind::Contradicts })
+            .unwrap();
+        // Default Contradicts = Flag. Recency selects both.
+        let pager = GreedyPager::new(store, tok);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&older));
+        assert!(plan.selected.contains(&newer));
+        let older_sel = plan.selections.iter().find(|s| s.block_id == older).unwrap();
+        let note = older_sel.note.as_deref().unwrap_or("");
+        assert!(note.contains("contradicted by newer block"), "note was {note:?}");
+        // The winner carries no note.
+        let newer_sel = plan.selections.iter().find(|s| s.block_id == newer).unwrap();
+        assert!(newer_sel.note.is_none());
+    }
+
+    #[test]
+    fn contradicts_prefer_newer_drops_the_older_block() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let older = store
+            .put(session, block(b"the sky is green", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let newer = store
+            .put(session, block(b"the sky is blue", BlockKind::Fact, 2, 2))
+            .unwrap();
+        store
+            .put_edge(Edge { from: newer, to: older, kind: EdgeKind::Contradicts })
+            .unwrap();
+        let policy = scoring_with(EdgePolicy {
+            contradicts: ContradictMode::PreferNewer,
+            ..EdgePolicy::default()
+        });
+        let pager = GreedyPager::new(store, tok).with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&newer));
+        assert!(!plan.selected.contains(&older));
+        let dropped = plan.omitted.iter().find(|o| o.block_id == older).unwrap();
+        assert_eq!(dropped.reason, OmissionReason::Contradicted);
+    }
+
+    #[test]
+    fn depth_cap_bounds_transitive_expansion() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        // claim → ev1 → ev2, all via Supports edges.
+        let ev2 = store
+            .put(session, block(b"deep evidence", BlockKind::Fact, 1, 1))
+            .unwrap();
+        let ev1 = store
+            .put(session, block(b"near evidence", BlockKind::Fact, 2, 2))
+            .unwrap();
+        let claim = store
+            .put(session, block(b"the claim", BlockKind::AssistantMessage, 3, 3))
+            .unwrap();
+        store
+            .put_edge(Edge { from: claim, to: ev1, kind: EdgeKind::Supports })
+            .unwrap();
+        store
+            .put_edge(Edge { from: ev1, to: ev2, kind: EdgeKind::Supports })
+            .unwrap();
+
+        // Default max_depth = 1: only the direct neighbor (ev1) comes in.
+        let pager = GreedyPager::new(store.clone(), tok.clone()).with_retrievers(vec![]);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![claim],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&ev1));
+        assert!(!plan.selected.contains(&ev2));
+
+        // max_depth = 2 reaches the second hop.
+        let policy = scoring_with(EdgePolicy { max_depth: 2, ..EdgePolicy::default() });
+        let pager = GreedyPager::new(store, tok)
+            .with_retrievers(vec![])
+            .with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(1_000, 0),
+                required_blocks: vec![claim],
+            })
+            .unwrap();
+        assert!(plan.selected.contains(&ev1));
+        assert!(plan.selected.contains(&ev2));
+    }
+
+    #[test]
+    fn fanout_cap_bounds_breadth_per_kind() {
+        let (store, _dir, tok) = setup();
+        let session = SessionId(1);
+        let claim = store
+            .put(session, block(b"the claim", BlockKind::AssistantMessage, 100, 100))
+            .unwrap();
+        for i in 0..6_u64 {
+            let bytes = format!("evidence {i}");
+            let ev = store
+                .put(session, block(bytes.as_bytes(), BlockKind::Fact, i + 1, u128::from(i + 1)))
+                .unwrap();
+            store
+                .put_edge(Edge { from: claim, to: ev, kind: EdgeKind::Supports })
+                .unwrap();
+        }
+        let policy = scoring_with(EdgePolicy { max_fanout: 2, ..EdgePolicy::default() });
+        let pager = GreedyPager::new(store, tok)
+            .with_retrievers(vec![])
+            .with_scoring(policy);
+        let plan = pager
+            .page(PageRequest {
+                session_id: session,
+                task: String::new(),
+                model: profile(10_000, 0),
+                required_blocks: vec![claim],
+            })
+            .unwrap();
+        let pulled = plan
+            .selections
+            .iter()
+            .filter(|s| matches!(s.reason, SelectionReason::Dependency))
+            .count();
+        assert_eq!(pulled, 2, "fan-out cap should limit pulled evidence to 2");
     }
 
     #[test]

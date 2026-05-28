@@ -188,7 +188,7 @@ mod tests {
     }
 
     fn sel(block_id: BlockId, reason: SelectionReason) -> Selection {
-        Selection { block_id, score: 0.5, reason }
+        Selection { block_id, score: 0.5, reason, note: None }
     }
 
     #[test]
