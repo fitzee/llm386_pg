@@ -58,6 +58,164 @@ LLM386 is the runtime under that surface. The pieces:
 
 It is a library first. The CLI is a thin shell over the library.
 
+## When to use LLM386 — and when not to
+
+LLM386's value-prop is **persistent, retrievable, edge-aware context that survives across turns and across sessions**. Whether that's a help or a hindrance for your agent depends on the agent's profile, not on LLM386's implementation quality. The fit question is worth answering up front, because the cost of getting it wrong is paid every turn: more tokens per call, and a behavioral side-effect described below.
+
+### The mechanism that matters
+
+The model treats relevant retrieved context as **authoritative working memory**, not as reference material that might be stale or partial. The more on-point each retrieved block is, the harder it is for the model to choose "I should verify this with a tool call" over "I already know." Effective retrieval is the very thing that triggers this.
+
+For some agents, that's exactly the design goal: don't re-derive what was already established; build on the prior reasoning. For others, it's an active failure mode: the agent's job is to verify current state, and skipping the verification step produces wrong answers.
+
+### Agents this fits well
+
+Persistent rich context is a strong fit when **the model's value comes from accumulated reasoning over expensive-to-rederive state**, and the state being reasoned about is stable enough that "cached belief" is a reasonable default. Characteristic traits:
+
+- **Tool calls or retrievals are expensive** — slow APIs, rate-limited integrations, model-call-as-tool, paid corpus access. Re-fetching has a real cost; remembering pays for itself.
+- **The world being reasoned about changes slowly or not at all** — a code repository at a point in time, a research corpus, a document the user is drafting. Cached context stays correct between turns.
+- **Reasoning IS the work product** — the agent's value is in the plans, intermediate analyses, evidence chains, or synthesis built up across turns. Losing that to recency-trim would force redoing the thinking.
+
+Concrete examples:
+
+- **Code-review or pair-programming agents** working over a PR or a repo across many turns. The codebase is stable; the model's accumulated observations ("this change in X contradicts the assumption in Y from earlier") are the deliverable.
+- **Long-form drafting assistants** where each turn refines based on decisions made 10 turns ago ("the tone we agreed on", "the structure we picked"). Recency-trim would discard precisely the part of the conversation that matters most.
+- **Multi-step planners and research/synthesis agents** that build up a plan or evidence base across many queries before producing output. The intermediate state IS the work; persisting it via the typed `Plan` / `State` / `Summary` block kinds is exactly what LLM386 is for.
+- **Agents over slow or rate-limited backends** — legal corpus search, scientific paper retrieval, ML model inference as a tool. Caching tool results in the prompt is cheaper than re-fetching them, both economically and in latency.
+
+### Agents this fits poorly
+
+Persistent rich context is the wrong default when **the agent's job is grounded verification of current state**, and the cost of a fabricated answer is high relative to the cost of an extra tool call. Characteristic traits:
+
+- **Tool calls return current state of a mutable world** — workspace metadata, live query results, file contents under active edit, anything users can change between turns. What you saw two turns ago may not be true now.
+- **Tool calls are cheap** — low-latency metadata reads, no LLM tokens, no quota cost. The economic argument for "remember instead of re-fetch" doesn't exist.
+- **A fabricated answer costs more than an extra tool call** — user trust, downstream actions on bad data, compliance / safety implications. Better to make the model re-verify than to trust cached belief.
+- **The agent's contract is "verify, then answer"** rather than "build on what we established earlier."
+
+Concrete examples:
+
+- **Workspace introspection agents** ("show me my dashboards", "run this query against my current data"). The workspace state is the question; the model can't know anything reliable about it without a fresh tool call.
+- **Live data assistants** querying production databases, monitoring dashboards, real-time feeds. Cached observations from prior turns become misleading the moment the underlying data updates.
+- **Operational agents that take actions** — anything where the model's answer leads to a SQL execution, a deploy, a file edit, an outgoing message. Confidence calibration matters more than working-memory continuity.
+- **Single-turn or short-horizon Q&A** where there's not enough conversation depth for accumulated context to add value, but every turn still pays the persistence + paging overhead.
+
+For these agents, a simpler `trim_messages`-style recency truncation is often accidentally well-calibrated: letting older context fall out of the prompt keeps the model honest about what it actually knows right now. The "wasted" tool calls are cheap; the cost of skipping them isn't.
+
+### Hybrid strategies if you're in between
+
+A few use cases sit on the fence — long-running collaboration on partly-mutable state. Two patterns are worth considering before adopting full persistent context:
+
+- **On-demand retrieval as a tool** — keep the same underlying store, but expose retrieval as a tool the model invokes when it decides it needs context. Same data, different framing for the model's confidence. The act of asking for context primes verification behavior in a way that auto-injected context does not.
+- **Selective persistence** — use LLM386 for the parts of the agent's context that genuinely don't change between turns (system prompt, user identity, tool catalog) for the prompt-caching benefit, but keep volatile state (workspace data, tool results) on a per-turn fetch-and-discard path. Gets the cache-friendliness win without the over-confidence drag.
+
+### Calibration is real, not free
+
+Independent of whether persistent context helps or hurts a given agent, the calibration cost is empirically non-negligible. Teams adopting LLM386 should plan to evaluate both architectures (LLM386 active vs. recency-trim baseline) on a representative judge suite before committing. Specifically watch:
+
+- **Provenance / grounding detectors** — does the agent's confidence calibration change when persistent context is active? If yes, in which direction?
+- **Tool-call rate per turn** — fewer tool calls might be a win (less redundant work) or a loss (skipped verification), depending on the agent. The same number can mean opposite things.
+- **Per-conversation cost** — persistent context isn't automatically cheaper. The prompt-caching win has to exceed the per-turn context-injection overhead, which depends on session length and how stable the cache prefix actually is across turns.
+
+The architecture is sound; the question is whether your agent's profile is one where richer working memory helps the model reason or fools it into skipping verification. Answer that empirically, not by intuition.
+
+## Advanced patterns
+
+### Verification-heavy agents with freshness reasoning
+
+If your agent falls into the "fits poorly" bucket above but you still want LLM386's benefits — cross-turn conversational continuity, prompt-cache friendliness, structured retrieval — there is a design space worth exploring. The over-confidence failure mode isn't strictly intrinsic to persistent context; it's the result of giving the model rich context **without** the meta-information needed to reason about whether to trust it. With the right coordination, persistent context and per-turn verification can coexist.
+
+This pattern is more work than either the baseline "trust everything cached" or the simple "verify everything per turn" defaults, and it has only been partially validated in the wild. Treat it as a design hypothesis you'll evaluate, not a turnkey configuration.
+
+The pattern has three coordinated parts. None is sufficient alone; the value comes from all three being in place.
+
+**1. Persist tool results with full provenance.**
+
+LLM386's typed-edge graph and the `tool-invocation` edge kind already preserve assistant-message ↔ tool-result pairing. To make freshness reasoning possible, also surface in the rendered prompt:
+
+- The `tool_call_id` (so the model sees a real assistant tool-call ↔ tool-result pair, not an unmoored "Tool result: ..." chunk).
+- The tool name and arguments that produced the result.
+- The wall-clock time the tool ran (typically the block's `created_at`, rendered as ISO 8601 in the prompt).
+
+LLM386 stores all of this; persisting it with the block content (via a small wrapper encoding, or via per-block metadata fields if added to the schema) lets the consumer reconstruct properly-typed `AIMessage(tool_calls=[...])` + `ToolMessage(tool_call_id=...)` pairs on re-pack, and lets the model see *when* each cached tool call ran.
+
+A representative prompt fragment after this is in place:
+
+```
+[assistant, 2026-05-31T10:42:00Z]
+  tool_call: list_dashboards(owned_by_me=true) [id=tc_a8f3]
+[tool, 2026-05-31T10:42:00Z, id=tc_a8f3]
+  {"total_count": 7, "dashboards": [...]}
+```
+
+**2. Teach the model to reason about freshness with a per-tool freshness model.**
+
+Models are empirically poor at deriving "is this stale?" from a timestamp alone. The system prompt has to give them an explicit freshness model categorized by tool class. There is no generic answer — the right model is per-agent and per-tool-surface, authored by someone who knows what each tool returns and how mutable that data is. Indicative template:
+
+```
+Tool result freshness:
+- Identity tools (whoami, get_user_info): valid for the session.
+- Schema definition tools (list_schemas, describe_table): valid for hours;
+  re-call only if the user mentions schema changes.
+- Workspace metadata tools (list_dashboards, list_datasets): valid for
+  ~5 minutes within an active conversation; re-call if the user implies
+  recency ("just added", "what's new", "now").
+- Query result tools (execute_sql, run_chart): valid only for the current
+  turn — always re-call on follow-up questions about live data.
+
+When using a prior tool result, cite when it was called
+("as of 10:42 UTC, you had 7 dashboards"). If the data class above
+says the result may have changed, re-call the tool instead of citing.
+```
+
+This is unusual prompt content but not radical. The model can follow rules about freshness *if* the rules are given; without them, it defaults to either "always trust the prompt" (over-confidence) or "always re-fetch" (cost + latency). The freshness model effectively becomes a fourth column in your tool catalog: name, args, description, **freshness class**.
+
+**3. Evaluate against a per-conversation grounding contract, not per-turn.**
+
+Default LLM judge rubrics ask: *"Did this turn's claim come from this turn's tool calls?"* That contract penalizes any use of cached tool results, regardless of whether the use is correct. To evaluate this pattern fairly, the judge needs to reason about conversational grounding with freshness:
+
+```
+A factual claim is grounded if:
+  (a) it comes from a tool call in the current turn, OR
+  (b) it comes from a tool call in a previous turn in the same
+      conversation, AND the data class is stable enough that the
+      prior call is still valid, AND the assistant cited when the
+      data was retrieved.
+
+A claim is ungrounded if it relies on training-data general knowledge
+with no supporting tool call (current or prior).
+
+A claim is a stale-reference failure if it cites a prior tool result
+for data that should have been re-verified.
+```
+
+This rubric is strictly harder to write well than per-turn grounding. The risk is that judges instructed to be lenient on prior-turn grounding also become lenient on real fabrications. The rubric has to be tight enough that the bar moves in the right direction without collapsing into "anything that looks plausible passes."
+
+#### Testing this pattern
+
+A minimum-viable evaluation requires all three pieces in place, run against a representative judge suite:
+
+1. LLM386 active with persisted tool results carrying provenance metadata as described above.
+2. System prompt instrumented with a per-tool freshness model authored for the agent's actual tool surface.
+3. Judge rubric updated to score per-conversation grounding with freshness rules.
+
+Without all three, the eval will misattribute the result: with (1) but not (2), the model defaults to over-trust; with (1) and (2) but not (3), even correct multi-turn grounding gets penalized as "no tool call this turn."
+
+Outcomes that meaningfully validate the pattern:
+
+- **Quality reaches or beats a per-turn-verification baseline** on the grounding detectors, *at lower cost per conversation* than the always-verify baseline. This is the design win — persistent context + reasoned freshness is genuinely cheaper-and-better than per-turn verification.
+- **Quality recovers partially**, but the recovery is concentrated on stable-data tool classes (identity, schema) while volatile classes (query results) still drag. This tells you which tool classes can move to the cached-with-freshness regime and which should stay always-verify.
+- **Quality doesn't recover**: the model can't reason about freshness reliably enough at this scale, and the pattern doesn't rescue the agent — back to the "doesn't fit" bucket with a clearer understanding of why.
+
+#### When this pattern is worth the engineering
+
+This is non-trivial coordination across the runtime, the agent's prompt, and the eval harness. It pays off when:
+
+- The agent is large enough that the per-conversation cost difference matters (production volume, paid-per-call backend, or long-horizon sessions).
+- The agent's tool surface has a meaningful spread of freshness classes — some genuinely stable data (worth caching) alongside volatile data (must re-verify). A surface where everything is one freshness class doesn't benefit much from the discrimination.
+- There is operational appetite to maintain a freshness model for the tool catalog over time. Adding a tool means assigning its freshness class.
+
+If those don't hold, the simpler per-turn-verification path is likely the right answer, and this pattern is over-engineering for the problem.
+
 ## Postgres backend
 
 This fork adds `llm386-store-pg`, a `BlockStore` implementation backed by PostgreSQL, sitting alongside the upstream `llm386-store-lmdb`. The trait surface in `llm386-core` is unchanged — every other crate (pager, packer, retriever, trace, reduce) is backend-agnostic.
